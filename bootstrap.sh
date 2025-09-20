@@ -6,6 +6,7 @@ set -euo pipefail
 : "${REPO_DIR:=/workspace/app}"
 : "${GIT_URL:?need GIT_URL env}"
 : "${PORT:=8000}"
+
 : "${PIP_TIMEOUT:=60}"
 : "${PIP_RETRIES:=3}"
 
@@ -16,10 +17,10 @@ echo "[bootstrap] ENV: WORKDIR=$WORKDIR REPO_DIR=$REPO_DIR PORT=$PORT"
 echo "[bootstrap] ENV: PIP_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL:-<unset>}"
 
 echo "[bootstrap] ensure tools: git/ffmpeg/python3/pip/curl"
-command -v git     >/dev/null 2>&1 || (apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*)
-command -v ffmpeg  >/dev/null 2>&1 || (apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*)
-command -v python3 >/dev/null 2>&1 || (apt-get update && apt-get install -y --no-install-recommends python3 python3-pip && rm -rf /var/lib/apt/lists/*)
-command -v curl    >/dev/null 2>&1 || (apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*)
+which git >/dev/null 2>&1 || (apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*)
+which ffmpeg >/dev/null 2>&1 || (apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*)
+which python3 >/dev/null 2>&1 || (apt-get update && apt-get install -y --no-install-recommends python3 python3-pip && rm -rf /var/lib/apt/lists/*)
+which curl >/dev/null 2>&1 || (apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*)
 
 mkdir -p "$WORKDIR"
 cd "$WORKDIR"
@@ -57,13 +58,18 @@ if [ -f requirements.txt ]; then
     echo "[bootstrap] use PIP_EXTRA_INDEX_URL=$PIP_EXTRA_INDEX_URL"
     PIP_ARGS+=(--extra-index-url "$PIP_EXTRA_INDEX_URL")
   else
-    echo "[bootstrap] detect if torch is already installed"
-    if python3 - <<'PY' 2>/dev/null; then
-import importlib.util, sys
-sys.exit(0 if importlib.util.find_spec("torch") is not None else 1)
+    echo "[bootstrap] detect cuda availability for pip extra index"
+    # 注意：heredoc 的 if，**这里不要在行尾写 then**，then 放在 PY 结束行之后
+    if python3 - <<'PY' 2>/dev/null
+import sys
+try:
+    import torch  # 可能未安装
+    print("torch_imported=True")
+except Exception:
+    print("torch_imported=False")
 PY
     then
-      echo "[bootstrap] torch is already importable; skip extra index auto inject"
+      echo "[bootstrap] torch module importable; skip extra index auto inject"
     else
       if [ "${DEVICE:-auto}" = "auto" ] || [ "${DEVICE:-auto}" = "cuda" ]; then
         echo "[bootstrap] DEVICE=$DEVICE, inject cu124 extra index for torch wheels"
@@ -82,7 +88,7 @@ PY
   done
 fi
 
-# -------- 运行前自检：CUDA/cuDNN/ctranslate2 --------
+# -------- 运行前自检 --------
 echo "[bootstrap] runtime quick check"
 python3 - <<'PY' || true
 import glob
