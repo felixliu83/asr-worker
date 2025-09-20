@@ -88,6 +88,15 @@ PY
   done
 fi
 
+#-----version-------
+echo "[bootstrap] write version file"
+TAG=$(git -C "$REPO_DIR" describe --tags --always 2>/dev/null || true)
+COMMIT=$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+VERSION=${TAG:-$COMMIT}
+printf '%s\n' "$VERSION" > /workspace/VERSION
+echo "[bootstrap] VERSION=$VERSION"
+
+
 # -------- 运行前自检 --------
 echo "[bootstrap] runtime quick check"
 python3 - <<'PY' || true
@@ -117,6 +126,4 @@ PY
 echo "[bootstrap] start uvicorn on :$PORT ..."
 exec uvicorn asr_worker:app --host 0.0.0.0 --port "$PORT" --reload
 
-cd "$REPO_DIR"
-COMMIT=$(git rev-parse --short HEAD || echo "unknown")
-echo "$COMMIT" > /workspace/VERSION
+
