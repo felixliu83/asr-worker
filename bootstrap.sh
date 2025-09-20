@@ -116,3 +116,7 @@ PY
 # -------- 启动服务 --------
 echo "[bootstrap] start uvicorn on :$PORT ..."
 exec uvicorn asr_worker:app --host 0.0.0.0 --port "$PORT" --reload
+
+cd "$REPO_DIR"
+COMMIT=$(git rev-parse --short HEAD || echo "unknown")
+echo "$COMMIT" > /workspace/VERSION
