@@ -81,7 +81,21 @@ class StartBody(BaseModel):
     glossary: Optional[List[str]] = []
 
 @app.get("/healthz")
-def healthz(): return {"ok": True, "model": WHISPER_MODEL, "device": _resolve_device(), "simulate": SIMULATE}
+
+def healthz():
+    version = "unknown"
+    try:
+        with open("/workspace/VERSION") as f:
+            version = f.read().strip()
+    except Exception:
+        pass
+    return {
+        "ok": True,
+        "model": WHISPER_MODEL,
+        "device": DEVICE,
+        "simulate": SIMULATE,
+        "version": version,
+    }
 
 @app.post("/asr/upload")
 def asr_upload(request: Request, file: UploadFile = File(...)):
