@@ -1,13 +1,18 @@
 # modules/text_clean.py
 import re
-from typing import Literal
+from typing import Literal, Optional, List
 
 # 常见口头禅
 FILLERS_ZH = {"嗯","呃","额","啊","这个","那个","就是","然后","对对对","你知道","我觉得"}
 FILLERS_EN = {"uh","um","erm","like","you know","i mean","sort of","kind of"}
 
 # 中文标点映射
-PUNCT_MAP_ZH = {".":"。", ",":"，", "?":"？", "!":"！", "…":"……", "....":"……", "...":"……"}
+PUNCT_MAP_ZH = {"…": "……", "....": "……", "...": "……"}
+
+# 仅针对 ASCII 标点的中式替换
+ASCII_TO_CJK_PUNCT = {".": "。", ",": "，", "?": "？", "!": "！", ";": "；"}
+
+RE_CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]")
 
 RE_MULTI_PUNCT = re.compile(r"([。，、；：？！…])\1{1,}")
 RE_MULTI_DOT   = re.compile(r"\.{2,}")
@@ -39,11 +44,47 @@ def guess_lang(text: str) -> Literal["zh","en"]:
     # 如果中文多于英文明显 → zh；否则按英文处理
     return "zh" if cjk >= max(1, int(lat*1.2)) else "en"
 
+def _is_cjk_char(ch: str) -> bool:
+    return bool(ch and RE_CJK.fullmatch(ch))
+
+
+def _prev_non_space(chars: List[str], idx: int) -> Optional[str]:
+    for j in range(idx - 1, -1, -1):
+        if not chars[j].isspace():
+            return chars[j]
+    return None
+
+
+def _next_non_space(chars: List[str], idx: int) -> Optional[str]:
+    for j in range(idx + 1, len(chars)):
+        if not chars[j].isspace():
+            return chars[j]
+    return None
+
+
+def _convert_ascii_punct_for_cjk_spans(text: str) -> str:
+    chars = list(text)
+    for idx, ch in enumerate(chars):
+        repl = ASCII_TO_CJK_PUNCT.get(ch)
+        if not repl:
+            continue
+        prev_char = _prev_non_space(chars, idx)
+        if prev_char is not None:
+            use_cjk = _is_cjk_char(prev_char)
+        else:
+            next_char = _next_non_space(chars, idx)
+            use_cjk = _is_cjk_char(next_char) if next_char is not None else False
+        if use_cjk:
+            chars[idx] = repl
+    return "".join(chars)
+
+
 def normalize_punct(text: str, lang: Literal["zh","en"]) -> str:
-    t = text.replace("....","……").replace("...","……")
+    t = text
     if lang == "zh":
-        for a,b in PUNCT_MAP_ZH.items():
-            t = t.replace(a,b)
+        for a, b in PUNCT_MAP_ZH.items():
+            t = t.replace(a, b)
+        t = _convert_ascii_punct_for_cjk_spans(t)
         t = RE_MULTI_PUNCT.sub(r"\1", t)
         t = RE_MULTI_DOT.sub("……", t)
     else:
