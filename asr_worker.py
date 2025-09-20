@@ -174,7 +174,8 @@ def _process_task(task_id: str):
             vad_filter=True,
             word_timestamps=True,
             initial_prompt=ctx_prompt,
-            condition_on_previous_text=True,
+            language=None,
+            condition_on_previous_text=False,
             temperature=0.0,
         )
 
