@@ -221,78 +221,83 @@ def asr_result(task_id: str):
         return t["result"]
 
 def _process_task(task_id: str):
-    norm_audio = to_wav16k_mono(audio_path)
-    with lock:
-        _append_log(tasks[task_id], f"audio_prepared: {norm_audio}")
-
+    # ---------- 0) 取任务&关键字段 ----------
     try:
         with lock:
-            t = tasks[task_id]
-            t["status"] = "processing"; t["progress"] = 5
-            audio_path = t["audio_path"]
+            t = tasks.get(task_id)
+            if not t:
+                return
+            t["status"] = "processing"
+            t["progress"] = 5
+            audio_path = t.get("audio_path")
             req = t.get("request")
             ctx_prompt = t.get("context_prompt") or None
+            _append_log(t, "start_processing")
+            if not audio_path or not os.path.exists(audio_path):
+                _fail_task(t, f"audio_missing: {audio_path}")
+                return
+    except Exception:
+        # 极端：tasks 取不到
+        return
 
-        # ====== 模拟分支 ======
-        if SIMULATE:
+    # ---------- 1) 模拟分支 ----------
+    if SIMULATE:
+        try:
             time.sleep(SIM_DELAY)
             demo = [
-                {"start":0,"end":3,"text":"模拟-欢迎","speaker":"SPK_00"},
-                {"start":3,"end":7,"text":"模拟-讨论","speaker":"SPK_00"},
-                {"start":7,"end":11,"text":"模拟-总结","speaker":"SPK_01"},
+                {"start": 0, "end": 3, "text": "模拟-欢迎", "speaker": "SPK_00"},
+                {"start": 3, "end": 7, "text": "模拟-讨论", "speaker": "SPK_00"},
+                {"start": 7, "end": 11, "text": "模拟-总结", "speaker": "SPK_01"},
             ]
             srt_path  = os.path.join(RESULT_DIR, f"{task_id}.srt")
             json_path = os.path.join(RESULT_DIR, f"{task_id}.json")
+            os.makedirs(RESULT_DIR, exist_ok=True)
             _write_srt(demo, srt_path)
             _save_json({"task_id": task_id, "segments": demo}, json_path)
+            preview = "\n".join(
+                ((f"[{d.get('speaker')}] " if d.get('speaker') else "") + d["text"]).strip()
+                for d in demo
+            ).strip()
             with lock:
-                tasks[task_id]["status"] = "succeeded"
-                tasks[task_id]["progress"] = 100
-                tasks[task_id]["result"] = {
-                    "aligned_preview": "\n".join(
-                        ((f"[{d['speaker']}] " if d.get('speaker') else "") + d['text']).strip()
-                        for d in demo
-                    ),
+                t = tasks[task_id]
+                t["status"] = "succeeded"
+                t["progress"] = 100
+                t["result"] = {
+                    "aligned_preview": preview,
                     "srt_url": _public_url(req, srt_path),
                     "json_url": _public_url(req, json_path),
                 }
-            return
-
-        # ====== 实际处理分支 ======
-        try:
-            with lock:
-                _append_log(tasks[task_id], "stage=prepare_audio")
-
-            norm_audio = to_wav16k_mono(audio_path)
-            with lock:
-                _append_log(tasks[task_id], f"audio_prepared: {norm_audio}")
-                tasks[task_id]["progress"] = 15
-
-            # ... 在这里跑 Whisper ASR ...
-            # ... 在这里跑 diarization（带 _resolve_device 修复）...
-            # ... 在这里跑 finalize_segments, _write_srt, _save_json ...
-
-            with lock:
-                tasks[task_id]["status"] = "succeeded"
-                tasks[task_id]["progress"] = 100
-                _append_log(tasks[task_id], "done")
+                _append_log(t, "done (simulate)")
         except Exception as e:
             import traceback
             tb = traceback.format_exc(limit=2)
             with lock:
-                _fail_task(tasks[task_id], f"{type(e).__name__}: {e}")
-                _append_log(tasks[task_id], tb)
+                t = tasks.get(task_id) or {}
+                _fail_task(t, f"{type(e).__name__}: {e}")
+                _append_log(t, tb)
+        return  # 模拟分支结束
 
-    except Exception as e:
-        # 极端情况：tasks[task_id] 自身取不到
-        return
+    # ---------- 2) 实际处理分支 ----------
+    try:
+        # 2.1 预处理音频：统一成 16k/mono，避免 m4a 早期失败
+        with lock:
+            t = tasks[task_id]
+            _append_log(t, "stage=prepare_audio")
+            t["progress"] = 10
+        norm_audio = to_wav16k_mono(audio_path)
+        with lock:
+            t = tasks[task_id]
+            _append_log(t, f"audio_prepared: {norm_audio}")
+            t["progress"] = 15
 
-        # 1) ASR
-        from faster_whisper import WhisperModel
-        model = _asr_load_model()
-        with lock: tasks[task_id]["progress"] = 10
+        # 2.2 ASR（faster-whisper）
+        with lock:
+            t = tasks[task_id]
+            _append_log(t, "stage=asr_start")
+            t["progress"] = 25
+        model = _asr_load_model()  # 你已有的加载函数
         segments, info = model.transcribe(
-            audio_path,
+            norm_audio,
             vad_filter=True,
             word_timestamps=True,
             initial_prompt=ctx_prompt,
@@ -300,71 +305,89 @@ def _process_task(task_id: str):
             condition_on_previous_text=False,
             temperature=0.0,
         )
-
-        words: List[Dict[str,Any]] = []
+        words: List[Dict[str, Any]] = []
         for seg in segments:
             if seg.words:
                 for w in seg.words:
                     words.append({"start": float(w.start), "end": float(w.end), "text": w.word})
-
-        with lock: tasks[task_id]["progress"] = 55
-
-
-        # 2) Diarization（可选）
-        diar_turns: List[Tuple[float,float,str]] = []
-        enable_diar = (DIARIZE == "on") or (DIARIZE == "auto" and PYANNOTE_TOKEN)
-
         with lock:
-            tasks[task_id].setdefault("logs", []).append(
-                f"diarization_enable={enable_diar} (DIARIZE={DIARIZE}, token={'yes' if PYANNOTE_TOKEN else 'no'})"
-            )
+            t = tasks[task_id]
+            _append_log(t, f"stage=asr_done: words={len(words)}")
+            t["progress"] = 55
 
-        if enable_diar:
-            try:
+        # 2.3 Diarization（失败不致命）
+        diar_turns: List[Tuple[float, float, str]] = []
+        enable_diar = (DIARIZE == "on") or (DIARIZE == "auto" and PYANNOTE_TOKEN)
+        with lock:
+            t = tasks[task_id]
+            _append_log(t, f"diarization_enable={enable_diar} (DIARIZE={DIARIZE}, token={'yes' if PYANNOTE_TOKEN else 'no'})")
+        try:
+            if enable_diar:
                 from pyannote.audio import Pipeline
-                wav_for_diar = _safe_wav_for_diar(audio_path)  # 临时规范化
                 pipeline = Pipeline.from_pretrained(
                     "pyannote/speaker-diarization-3.1",
                     use_auth_token=PYANNOTE_TOKEN or None
                 )
+                # 确保 _resolve_device 返回 torch.device（前面已修过）
                 pipeline.to(_resolve_device())
+                # 给 pyannote 用规范化后的 wav（更稳）
+                wav_for_diar = _safe_wav_for_diar(norm_audio)
                 diar = pipeline(wav_for_diar)
                 for turn, _, speaker in diar.itertracks(yield_label=True):
                     diar_turns.append((float(turn.start), float(turn.end), str(speaker)))
                 with lock:
-                    tasks[task_id]["progress"] = 75
-                    tasks[task_id].setdefault("logs", []).append(f"diarization_ok: turns={len(diar_turns)}")
-            except Exception as e:
-                diar_turns = []
+                    t = tasks[task_id]
+                    _append_log(t, f"diarization_ok: turns={len(diar_turns)}")
+                    t["progress"] = 75
+            else:
                 with lock:
-                    tasks[task_id].setdefault("logs", []).append(f"diarization_failed: {type(e).__name__}: {e}")
-                logger.exception("Diarization failed")
-        else:
+                    t = tasks[task_id]
+                    _append_log(t, "diarization_skipped")
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc(limit=1)
             with lock:
-                tasks[task_id].setdefault("logs", []).append("diarization_skipped")
+                t = tasks[task_id]
+                _append_log(t, f"diarization_failed: {type(e).__name__}: {e}")
+                _append_log(t, tb)
+            diar_turns = []  # 不中断
 
-
-        # 3) 对齐 + 清洗
+        # 2.4 对齐 + 清洗
+        with lock:
+            t = tasks[task_id]
+            _append_log(t, "stage=align_start")
         final_segments = finalize_segments(words, diar_turns, lang_hint="zh")
+        # 文本清洗
         for seg in final_segments:
             seg["text"] = clean_text(seg["text"], lang_hint="auto")
         final_segments = [s for s in final_segments if s["text"]]
 
-        # 4) 保存产物
+        # 2.5 写出 SRT/JSON
         srt_path  = os.path.join(RESULT_DIR, f"{task_id}.srt")
         json_path = os.path.join(RESULT_DIR, f"{task_id}.json")
+        os.makedirs(RESULT_DIR, exist_ok=True)
         _write_srt(final_segments, srt_path)
         _save_json({"task_id": task_id, "segments": final_segments}, json_path)
 
         preview = "\n".join(
-            (f"[{s.get('speaker')}] " if s.get("speaker") else "") + s["text"]
+            ((f"[{s.get('speaker')}] " if s.get("speaker") else "") + s["text"]).strip()
             for s in final_segments[:12]
         ).strip()
 
         with lock:
-            tasks[task_id]["status"]="succeeded"; tasks[task_id]["progress"]=100
-            tasks[task_id]["result"] = {"aligned_preview": preview, "srt_url": _public_url(req, srt_path), "json_url": _public_url(req, json_path)}
-
+            t = tasks[task_id]
+            t["result"] = {
+                "aligned_preview": preview,
+                "srt_url": _public_url(req, srt_path),
+                "json_url": _public_url(req, json_path),
+            }
+            t["status"] = "succeeded"
+            t["progress"] = 100
+            _append_log(t, "done")
     except Exception as e:
+        import traceback
+        tb = traceback.format_exc(limit=3)
         with lock:
-            tasks[task_id]["status"]="failed"; tasks[task_id]["error"] = str(e)
+            t = tasks.get(task_id) or {}
+            _fail_task(t, f"{type(e).__name__}: {e}")
+            _append_log(t, tb)
