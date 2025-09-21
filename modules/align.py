@@ -9,8 +9,10 @@ import string
 __all__ = [
     "merge_ascii_fragments",
     "assign_speaker_to_words",
+    "fix_boundary_tokens",
     "merge_words_to_segments",
     "merge_short_segments_same_speaker",
+    "revote_segment_speaker_by_overlap",
     "renumber_speakers_by_first_appearance",
     "attach_speaker_by_overlap",
     "finalize_segments",
@@ -30,7 +32,6 @@ def _smart_join(prev: str, token: str) -> str:
     b = token[:1]
     if a.isascii() and b.isascii():
         return prev + " " + token
-    # 前 ASCII、后中文：无需额外空格；中文标点直接拼接
     return prev + token
 
 
@@ -127,6 +128,50 @@ def assign_speaker_to_words(words: List[Dict[str, Any]],
 
         w["speaker"] = best_spk
 
+    return words
+
+
+# -------------------- 词级边界纠偏（吸附到边界后说话人） --------------------
+
+def fix_boundary_tokens(words: List[Dict[str, Any]],
+                        turns: List[Tuple[float, float, str]],
+                        max_token_dur: float = 0.22,
+                        snap_window: float = 0.25) -> List[Dict[str, Any]]:
+    """
+    专修“句末最后一个字（极短 token）落到上一段”的问题：
+      - 仅处理持续时长 <= max_token_dur 的 token
+      - 若 token 的结束时间距离某个 turn 边界 <= snap_window，
+        且当前 token 标注的 speaker != 边界“之后”的 speaker，则改为之后的 speaker。
+    """
+    if not words or not turns:
+        return words
+
+    turns_sorted = sorted(turns, key=lambda x: x[0])  # 按 start 排序
+    # 构建边界：每个 turn 的结束点，以及它之后的说话人
+    boundaries: List[Tuple[float, Optional[str]]] = []
+    for i, (ts, te, s) in enumerate(turns_sorted):
+        spk_after = turns_sorted[i + 1][2] if i + 1 < len(turns_sorted) else s
+        boundaries.append((float(te), spk_after))
+
+    def nearest_boundary(t: float):
+        # 返回离时间 t 最近的边界 (tb, spk_after, dist, side)
+        best = (1e9, None, 0)
+        for tb, spk_after in boundaries:
+            d = abs(t - tb)
+            if d < best[0]:
+                side = -1 if t < tb else +1  # t 在边界左/右
+                best = (d, spk_after, side)
+        return best
+
+    for w in words:
+        ws, we = float(w["start"]), float(w["end"])
+        dur = we - ws
+        if dur > max_token_dur:
+            continue
+        dist, spk_after, side = nearest_boundary(we)
+        if dist <= snap_window and spk_after:
+            if side > 0 and w.get("speaker") != spk_after:
+                w["speaker"] = spk_after
     return words
 
 
@@ -227,6 +272,42 @@ def merge_short_segments_same_speaker(segments: List[Dict[str, Any]],
     return out
 
 
+# -------------------- 段级重投票（IoU 兜底修正） --------------------
+
+def revote_segment_speaker_by_overlap(segments: List[Dict[str, Any]],
+                                      turns: List[Tuple[float, float, str]],
+                                      iou_margin: float = 0.15) -> List[Dict[str, Any]]:
+    """
+    对每个段，计算与各 turn 的重叠时长，取重叠总和最大的 speaker。
+    若该 speaker 与当前不同，且相对优势 > iou_margin，则改写。
+    用于修复整段被误标到另一个 speaker 的情况。
+    """
+    if not segments or not turns:
+        return segments
+
+    for seg in segments:
+        us, ue = float(seg["start"]), float(seg["end"])
+        overlaps: Dict[str, float] = {}
+        for (ts, te, spk) in turns:
+            inter = max(0.0, min(ue, te) - max(us, ts))
+            if inter > 0:
+                overlaps[spk] = overlaps.get(spk, 0.0) + inter
+
+        if not overlaps:
+            continue
+
+        best_spk, best_ov = max(overlaps.items(), key=lambda x: x[1])
+        cur_spk = seg.get("speaker")
+        cur_ov = overlaps.get(cur_spk, 0.0)
+
+        if cur_spk is None or best_spk != cur_spk:
+            # 相对提升超过阈值才改，避免边界抖动
+            if cur_ov == 0.0 or (best_ov > cur_ov * (1.0 + iou_margin)):
+                seg["speaker"] = best_spk
+
+    return segments
+
+
 # -------------------- 首现顺序重命名 --------------------
 
 def renumber_speakers_by_first_appearance(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -284,24 +365,32 @@ def finalize_segments(words: List[Dict[str, Any]],
                       lang_hint: str = "auto") -> List[Dict[str, Any]]:
     """
     1) 合并英文碎片（修复 I sa ac -> Isaac）
-    2) 逐词贴 speaker（最大重叠优先，边界更稳）
+    2) 逐词贴 speaker（最大重叠优先）
+    2.5) 词级边界纠偏（修“句末最后一个字跑错段”）
     3) 以“换人=硬切”合并成句段（结合停顿/时长）
-    4) 同 speaker 短段再合并（避免过碎，不跨 speaker）
+    4) 同 speaker 短段再合（不跨 speaker）
+    4.5) 段级 IoU 兜底重投票（修整段 speaker 误标）
     5) 按首现顺序重命名为 SPEAKER_00/01/...
     """
-    # (1) 先把英文碎片合一，避免把一个名字拆成多词导致跨段
+    # 1) 英文碎片合并
     words = merge_ascii_fragments(words, max_gap=0.20, max_pieces=3)
 
-    # (2) 逐词贴 speaker（最大重叠）
+    # 2) 逐词贴 speaker
     words = assign_speaker_to_words(words, diar_turns)
 
-    # (3) 合并为句段（换人=硬切）
+    # 2.5) 边界纠偏（针对极短 token）
+    words = fix_boundary_tokens(words, diar_turns, max_token_dur=0.22, snap_window=0.25)
+
+    # 3) 合并为句段（换人=硬切）
     sents = merge_words_to_segments(words, max_gap=0.60, max_dur=8.0)
 
-    # (4) 同 speaker 短段再合（可调整/关闭）
+    # 4) 同 speaker 短段再合（避免过碎）
     sents = merge_short_segments_same_speaker(sents, min_dur=0.30)
 
-    # (5) 首现顺序重命名（SPEAKER_00 开始）
+    # 4.5) 段级 IoU 兜底“重投票”
+    sents = revote_segment_speaker_by_overlap(sents, diar_turns, iou_margin=0.15)
+
+    # 5) 首现顺序重命名
     sents = renumber_speakers_by_first_appearance(sents)
 
     return sents
