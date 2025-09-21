@@ -31,13 +31,22 @@ lock = threading.Lock()
 app.mount("/results", StaticFiles(directory=RESULT_DIR), name="results")
 
 def _resolve_device():
-    if DEVICE == "auto":
-        try:
-            import torch
-            return "cuda" if torch.cuda.is_available() else "cpu"
-        except Exception:
-            return "cpu"
-    return DEVICE
+    import os, torch
+    dev = (os.environ.get("DEVICE") or "").lower().strip()
+
+    # 允许 auto / cuda / cpu / gpu
+    if dev in ("auto", "", None):
+        return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    if dev in ("cuda", "gpu"):
+        return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    if dev == "cpu":
+        return torch.device("cpu")
+
+    # 兼容 "cuda:0" 这种写法
+    try:
+        return torch.device(dev)
+    except Exception:
+        return torch.device("cpu")
 
 def _asr_load_model():
     from faster_whisper import WhisperModel
