@@ -5,6 +5,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import requests
 import subprocess, shutil, tempfile, os
+from uuid import uuid4
 
 from modules.text_clean import clean_text
 from modules.align import finalize_segments
