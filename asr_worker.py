@@ -150,16 +150,35 @@ def healthz():
 
 @app.post("/asr/upload")
 def asr_upload(request: Request, file: UploadFile = File(...)):
-    ext = os.path.splitext(file.filename or "")[1] or ".wav"
-    task_id = str(uuid.uuid4())
-    path = os.path.join(UPLOAD_DIR, f"{task_id}{ext}")
-    with open(path, "wb") as f: f.write(file.file.read())
+    task_id = str(uuid4())
+
+    # 1) 保存上传文件
+    filename = f"{task_id}_{file.filename}"
+    save_path = os.path.join(UPLOAD_DIR, filename)
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    with open(save_path, "wb") as f:
+        f.write(file.file.read())
+
+    # 2) 先初始化 tasks[task_id]（在线程启动前，且放在锁里）
     with lock:
-        t = tasks[task_id]
-        t["status"] = "queued"
-        t["progress"] = 5
-        _append_log(t, f"upload_ok: path={save_path}, size={os.path.getsize(save_path)}B")
+        tasks[task_id] = {
+            "status": "queued",
+            "progress": 5,
+            "audio_path": save_path,
+            # 你后面会用到 base_url 来拼可访问的结果链接
+            "request": {"base_url": str(request.base_url).rstrip("/")},
+            "context_prompt": None,
+            "result": None,
+            "logs": []
+        }
+        # 记录upload信息，方便排查早期失败
+        size = os.path.getsize(save_path)
+        tasks[task_id]["logs"].append(f"upload_ok: path={save_path}, size={size}B")
+
+    # 3) 启动后台处理线程（daemon=True，避免主进程退出卡住）
     threading.Thread(target=_process_task, args=(task_id,), daemon=True).start()
+
+    # 4) 返回task信息
     return {"task_id": task_id, "status": "queued"}
 
 @app.post("/asr/start")
