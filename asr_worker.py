@@ -7,9 +7,8 @@ import requests
 import subprocess, shutil, tempfile, os
 from uuid import uuid4
 from modules.text_clean import clean_text
-from modules.align import finalize_segments
+from modules.align import finalize_segments, assign_speaker_to_words, renumber_speakers_by_first_appearance
 from faster_whisper import WhisperModel
-from align import assign_speaker_to_words, renumber_speakers_by_first_appearance
 
 
 BASE_DIR      = os.environ.get("BASE_DIR", "./data")
