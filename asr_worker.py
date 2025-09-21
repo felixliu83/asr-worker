@@ -4,6 +4,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import requests
+import subprocess, shutil, tempfile, os
 
 from modules.text_clean import clean_text
 from modules.align import finalize_segments
@@ -73,6 +74,23 @@ def _public_url(request: Optional[Request], filepath: str) -> str:
     base = str(request.base_url).rstrip("/") if request else ""
     return f"{base}/results/{os.path.basename(filepath)}"
 
+def _safe_wav_for_diar(original_path: str) -> str:
+    """给 pyannote 用的 16k 单声道临时 wav；ffmpeg 不在则原样返回。"""
+    if not shutil.which("ffmpeg"):
+        return original_path
+    try:
+        tmpdir = tempfile.mkdtemp(prefix="diar_")
+        out = os.path.join(tmpdir, "diar_16k_mono.wav")
+        # -ac 1 单声道，-ar 16000 采样率
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", original_path, "-ac", "1", "-ar", "16000", "-vn", out],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+        )
+        return out
+    except Exception:
+        return original_path
+
+
 class StartBody(BaseModel):
     audio_url: str
     series_id: Optional[str] = ""
@@ -129,9 +147,15 @@ def asr_start(request: Request, body: StartBody):
 def asr_status(task_id: str):
     with lock:
         t = tasks.get(task_id)
-        if not t: return {"task_id": task_id, "status": "not_found"}
-        return {"task_id": task_id, "status": t["status"], "progress": t.get("progress", 0)}
-
+        if not t:
+            return {"task_id": task_id, "status": "not_found"}
+        return {
+            "task_id": task_id,
+            "status": t["status"],
+            "progress": t.get("progress", 0),
+            "logs": t.get("logs", []),
+        }
+    
 @app.get("/asr/result")
 def asr_result(task_id: str):
     with lock:
@@ -187,21 +211,40 @@ def _process_task(task_id: str):
 
         with lock: tasks[task_id]["progress"] = 55
 
+
         # 2) Diarization（可选）
         diar_turns: List[Tuple[float,float,str]] = []
         enable_diar = (DIARIZE == "on") or (DIARIZE == "auto" and PYANNOTE_TOKEN)
+
+        with lock:
+            tasks[task_id].setdefault("logs", []).append(
+                f"diarization_enable={enable_diar} (DIARIZE={DIARIZE}, token={'yes' if PYANNOTE_TOKEN else 'no'})"
+            )
+
         if enable_diar:
             try:
                 from pyannote.audio import Pipeline
-                pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", use_auth_token=PYANNOTE_TOKEN)
+                wav_for_diar = _safe_wav_for_diar(audio_path)  # 临时规范化
+                pipeline = Pipeline.from_pretrained(
+                    "pyannote/speaker-diarization-3.1",
+                    use_auth_token=PYANNOTE_TOKEN or None
+                )
                 pipeline.to(_resolve_device())
-                diar = pipeline(audio_path)
+                diar = pipeline(wav_for_diar)
                 for turn, _, speaker in diar.itertracks(yield_label=True):
                     diar_turns.append((float(turn.start), float(turn.end), str(speaker)))
-                with lock: tasks[task_id]["progress"] = 75
+                with lock:
+                    tasks[task_id]["progress"] = 75
+                    tasks[task_id].setdefault("logs", []).append(f"diarization_ok: turns={len(diar_turns)}")
             except Exception as e:
                 diar_turns = []
-                with lock: tasks[task_id].setdefault("logs", []).append(f"diarization_failed: {e}")
+                with lock:
+                    tasks[task_id].setdefault("logs", []).append(f"diarization_failed: {type(e).__name__}: {e}")
+                logger.exception("Diarization failed")
+        else:
+            with lock:
+                tasks[task_id].setdefault("logs", []).append("diarization_skipped")
+
 
         # 3) 对齐 + 清洗
         final_segments = finalize_segments(words, diar_turns, lang_hint="zh")
@@ -215,7 +258,11 @@ def _process_task(task_id: str):
         _write_srt(final_segments, srt_path)
         _save_json({"task_id": task_id, "segments": final_segments}, json_path)
 
-        preview = "\n".join(((f"[{s.get('speaker')}] " if s.get('speaker') else "") + s["text"]).strip() for s in final_segments[:12])
+        preview = "\n".join(
+            (f"[{s.get('speaker')}] " if s.get("speaker") else "") + s["text"]
+            for s in final_segments[:12]
+        ).strip()
+
         with lock:
             tasks[task_id]["status"]="succeeded"; tasks[task_id]["progress"]=100
             tasks[task_id]["result"] = {"aligned_preview": preview, "srt_url": _public_url(req, srt_path), "json_url": _public_url(req, json_path)}

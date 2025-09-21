@@ -63,20 +63,44 @@ def cut_sentences_by_punct(words: List[Dict[str,Any]], punct: str=_PUNCT, gap: f
             out.append(s)
     return out
 
-def attach_speaker_by_overlap(units: List[Dict[str,Any]], turns: List[Tuple[float,float,str]]) -> List[Dict[str,Any]]:
+def attach_speaker_by_overlap(units: List[Dict[str, Any]],
+                              turns: List[Tuple[float, float, str]]) -> List[Dict[str, Any]]:
+    """
+    按 IoU 最大给句段贴说话人；若当前句段与任何 turn 无重叠，则沿用上一个说话人（保底策略）。
+    units: [{"start": float, "end": float, "text": str, ...}, ...]
+    turns: [(start: float, end: float, speaker: str), ...]
+    """
     if not turns:
         return [{**u, "speaker": None} for u in units]
-    out = []
+
+    out: List[Dict[str, Any]] = []
+    last_spk: Optional[str] = None
+
     for u in units:
-        us, ue = u["start"], u["end"]
-        best = (0.0, None)
+        us, ue = float(u["start"]), float(u["end"])
+        best_iou = 0.0
+        best_spk: Optional[str] = None
+
         for (ts, te, spk) in turns:
+            # 交并比（IoU）
             inter = max(0.0, min(ue, te) - max(us, ts))
             union = max(ue, te) - min(us, ts)
-            iou = inter/union if union > 0 else 0.0
-            if inter > 0 and iou > best[0]:
-                best = (iou, spk)
-        out.append({**u, "speaker": best[1]})
+            iou = (inter / union) if union > 0 else 0.0
+
+            if inter > 0.0 and iou > best_iou:
+                best_iou = iou
+                best_spk = spk
+
+        # 保底：若没有任何重叠（best_spk 仍为 None），沿用上一个说话人
+        spk_to_use = best_spk if best_spk is not None else last_spk
+
+        out_unit = {**u, "speaker": spk_to_use}
+        out.append(out_unit)
+
+        # 只有在当前得到明确说话人时，才更新 last_spk
+        if spk_to_use is not None:
+            last_spk = spk_to_use
+
     return out
 
 def finalize_segments(words: List[Dict[str,Any]],
