@@ -4,7 +4,7 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import requests
-import subprocess, shutil, tempfile, os
+import subprocess, shutil, tempfile, os, re
 from uuid import uuid4
 from modules.text_clean import clean_text
 from modules.align import finalize_segments, assign_speaker_to_words, renumber_speakers_by_first_appearance
@@ -31,6 +31,11 @@ tasks: Dict[str, Dict[str, Any]] = {}
 lock = threading.Lock()
 
 app.mount("/results", StaticFiles(directory=RESULT_DIR), name="results")
+
+ZW_RE = re.compile(r"[\x00\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]")
+
+def _strip_invisibles(s: str) -> str:
+    return ZW_RE.sub("", s or "")
 
 
 def _device_for_pyannote():
@@ -412,17 +417,20 @@ def _process_task(task_id: str):
 
         # 合并（确保 finalize_segments 尊重 word['speaker'] 边界）
         final_segments = finalize_segments(words, diar_turns, lang_hint="zh")
-
+        
         # 让第一个开口的人从 SPEAKER_00 开始
         final_segments = renumber_speakers_by_first_appearance(final_segments)
 
-        # 文本清洗（含去零宽字符）
+
+        # 文本清洗：去零宽 + 你已有的 clean_text
         for seg in final_segments:
-            seg["text"] = seg["text"].replace("\x00", "")
+            seg["text"] = _strip_invisibles(seg["text"])
             seg["text"] = clean_text(seg["text"], lang_hint="auto")
 
         # 过滤空段（可选）
         final_segments = [s for s in final_segments if s["text"]]
+
+
 
         # 2.5 写出 SRT/JSON
         srt_path  = os.path.join(RESULT_DIR, f"{task_id}.srt")
@@ -442,6 +450,7 @@ def _process_task(task_id: str):
                 "aligned_preview": preview,
                 "srt_url": _public_url(req, srt_path),
                 "json_url": _public_url(req, json_path),
+                "segments": final_segments,          # ← 新增：直接带回分段
             }
             t["status"] = "succeeded"
             t["progress"] = 100
