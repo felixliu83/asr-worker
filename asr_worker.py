@@ -106,10 +106,34 @@ def _save_json(obj: Any, path: str):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
-def _public_url(request: Optional[Request], filepath: str) -> str:
-    base = str(request.base_url).rstrip("/") if request else ""
-    return f"{base}/results/{os.path.basename(filepath)}"
+def _public_url(request_or_base, path: str) -> str:
+    # 已是完整 URL，直接返回
+    if isinstance(path, str) and (path.startswith("http://") or path.startswith("https://")):
+        return path
 
+    base = ""
+    obj = request_or_base
+
+    # FastAPI Request 对象
+    if hasattr(obj, "headers") or hasattr(obj, "base_url"):
+        try:
+            xfh = obj.headers.get("x-forwarded-host")
+            xfp = obj.headers.get("x-forwarded-proto", "https")
+            if xfh:
+                base = f"{xfp}://{xfh}"
+            else:
+                base = str(obj.base_url).rstrip("/")
+        except Exception:
+            base = ""
+    # 历史写法：dict 里可能存了 {"base_url": "..."}
+    elif isinstance(obj, dict):
+        base = str(obj.get("base_url", "")).rstrip("/")
+    # 推荐写法：直接存字符串
+    elif isinstance(obj, str):
+        base = obj.rstrip("/")
+
+    rel = path.lstrip("./")
+    return f"{base}/{rel}" if base else rel
 def _safe_wav_for_diar(original_path: str) -> str:
     """给 pyannote 用的 16k 单声道临时 wav；ffmpeg 不在则原样返回。"""
     if not shutil.which("ffmpeg"):
@@ -177,29 +201,36 @@ def asr_upload(request: Request, file: UploadFile = File(...)):
     save_path = os.path.join(UPLOAD_DIR, filename)
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     with open(save_path, "wb") as f:
-        f.write(file.file.read())
+        shutil.copyfileobj(file.file, f)
 
-    # 2) 先初始化 tasks[task_id]（在线程启动前，且放在锁里）
+    # 2) 计算外部 base_url（优先使用反代头，Runpod 常用）
+    xfh = request.headers.get("x-forwarded-host")
+    xfp = request.headers.get("x-forwarded-proto", "https")
+    if xfh:
+        base_url = f"{xfp}://{xfh}"
+    else:
+        base_url = str(request.base_url).rstrip("/")
+
+    # 3) 初始化任务（放锁内）
     with lock:
         tasks[task_id] = {
             "status": "queued",
             "progress": 5,
             "audio_path": save_path,
-            # 你后面会用到 base_url 来拼可访问的结果链接
-            "request": {"base_url": str(request.base_url).rstrip("/")},
+            # 以后统一把这个字段当 **字符串** 使用
+            "request": base_url,
             "context_prompt": None,
             "result": None,
-            "logs": []
+            "logs": [f"upload_ok: path={save_path}, size={os.path.getsize(save_path)}B"],
         }
-        # 记录upload信息，方便排查早期失败
-        size = os.path.getsize(save_path)
-        tasks[task_id]["logs"].append(f"upload_ok: path={save_path}, size={size}B")
 
-    # 3) 启动后台处理线程（daemon=True，避免主进程退出卡住）
+    # 4) 起后台线程
     threading.Thread(target=_process_task, args=(task_id,), daemon=True).start()
 
-    # 4) 返回task信息
+    # 5) 返回
     return {"task_id": task_id, "status": "queued"}
+
+
 
 @app.post("/asr/start")
 def asr_start(request: Request, body: StartBody):
