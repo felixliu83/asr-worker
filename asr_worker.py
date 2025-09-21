@@ -9,6 +9,7 @@ from uuid import uuid4
 from modules.text_clean import clean_text
 from modules.align import finalize_segments
 from faster_whisper import WhisperModel
+from align import assign_speaker_to_words, renumber_speakers_by_first_appearance
 
 
 BASE_DIR      = os.environ.get("BASE_DIR", "./data")
@@ -402,14 +403,26 @@ def _process_task(task_id: str):
                 _append_log(t, tb)
             diar_turns = []  # 不中断
 
-        # 2.4 对齐 + 清洗
+        # ★ 2.4 逐词贴 speaker → 合并（遇 speaker 变化就切段）→ 重命名 → 清洗
         with lock:
             t = tasks[task_id]
             _append_log(t, "stage=align_start")
+
+        # 给每个词打上 speaker（若 diar 失败则全为 None）
+        words = assign_speaker_to_words(words, diar_turns)
+
+        # 合并（确保 finalize_segments 尊重 word['speaker'] 边界）
         final_segments = finalize_segments(words, diar_turns, lang_hint="zh")
-        # 文本清洗
+
+        # 让第一个开口的人从 SPEAKER_00 开始
+        final_segments = renumber_speakers_by_first_appearance(final_segments)
+
+        # 文本清洗（含去零宽字符）
         for seg in final_segments:
+            seg["text"] = seg["text"].replace("\x00", "")
             seg["text"] = clean_text(seg["text"], lang_hint="auto")
+
+        # 过滤空段（可选）
         final_segments = [s for s in final_segments if s["text"]]
 
         # 2.5 写出 SRT/JSON
@@ -434,6 +447,7 @@ def _process_task(task_id: str):
             t["status"] = "succeeded"
             t["progress"] = 100
             _append_log(t, "done")
+
     except Exception as e:
         import traceback
         tb = traceback.format_exc(limit=3)

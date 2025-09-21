@@ -7,6 +7,53 @@ _OPEN  = "（【《「『(\"“‘[({"
 _CLOSE = "，。？！；：、）】》」』)\"”’]}\'.,"  # 加入中英标点与引号
 _PUNCT = "。？！.!?"                         # 句末标点：中英都考虑
 
+
+def assign_speaker_to_words(words: List[Dict[str, Any]],
+                            turns: List[Tuple[float, float, str]]) -> List[Dict[str, Any]]:
+    """
+    words: [{"start": float, "end": float, "text": str}, ...]
+    turns: [(ts, te, "SPEAKER_xx"), ...]
+    return: words with "speaker"
+    """
+    if not turns:
+        for w in words:
+            w["speaker"] = None
+        return words
+
+    for w in words:
+        mid = 0.5 * (float(w["start"]) + float(w["end"]))
+        spk = None
+        # 先找包含的 turn
+        for (ts, te, s) in turns:
+            if ts <= mid <= te:
+                spk = s
+                break
+        # 找不到就选距离最近的 turn
+        if spk is None:
+            best = (1e9, None)
+            for (ts, te, s) in turns:
+                d = 0.0 if ts <= mid <= te else min(abs(mid - ts), abs(mid - te))
+                if d < best[0]:
+                    best = (d, s)
+            spk = best[1]
+        w["speaker"] = spk
+    return words
+
+
+def renumber_speakers_by_first_appearance(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """把说话人按首现顺序重命名为 SPEAKER_00, 01, 02..."""
+    mapping, nxt = {}, 0
+    for seg in segments:
+        spk = seg.get("speaker")
+        if not spk:
+            continue
+        if spk not in mapping:
+            mapping[spk] = f"SPEAKER_{nxt:02d}"
+            nxt += 1
+        seg["speaker"] = mapping[spk]
+    return segments
+
+
 def smart_join(prev: str, token: str) -> str:
     """智能拼接：中文-中文、标点前、开括号后、英文缩写的 `'` 都不加空格；其他情况按需加空格。"""
     if not prev:
