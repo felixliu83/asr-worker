@@ -1,4 +1,4 @@
-import os, json, uuid, time, threading
+import os, json, uuid, time, threading, torch
 from typing import Dict, Any, Optional, List, Tuple
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
@@ -6,9 +6,10 @@ from pydantic import BaseModel
 import requests
 import subprocess, shutil, tempfile, os
 from uuid import uuid4
-
 from modules.text_clean import clean_text
 from modules.align import finalize_segments
+from faster_whisper import WhisperModel
+
 
 BASE_DIR      = os.environ.get("BASE_DIR", "./data")
 UPLOAD_DIR    = os.path.join(BASE_DIR, "uploads")
@@ -30,6 +31,23 @@ tasks: Dict[str, Dict[str, Any]] = {}
 lock = threading.Lock()
 
 app.mount("/results", StaticFiles(directory=RESULT_DIR), name="results")
+
+
+def _device_for_pyannote():
+    dev = (os.environ.get("DEVICE") or "auto").lower()
+    if dev in ("auto", ""):
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        return torch.device(dev)
+    except Exception:
+        return torch.device("cpu")
+
+def _device_str_for_whisper():
+    dev = (os.environ.get("DEVICE") or "auto").lower()
+    if dev in ("auto", ""):
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    # 兼容 "cuda:0" 之类写法
+    return "cuda" if dev.startswith("cuda") else "cpu"
 
 def _append_log(task, msg):
     task.setdefault("logs", []).append(str(msg))
@@ -56,13 +74,14 @@ def _resolve_device():
     except Exception:
         return torch.device("cpu")
 
+
 def _asr_load_model():
-    from faster_whisper import WhisperModel
-    device = _resolve_device()
-    compute = COMPUTE_TYPE
-    if device == "cpu" and compute not in ("int8", "int8_float16", "int16"):
-        compute = "int8"
-    return WhisperModel(WHISPER_MODEL, device=device, compute_type=compute)
+    device = _device_str_for_whisper()  # 字符串
+    compute = (os.environ.get("COMPUTE_TYPE") or "auto").lower()
+    if compute in ("auto", ""):
+        compute = "float16" if device == "cuda" else "int8"  # CPU 默认 int8 更稳
+    return WhisperModel(WHISPER_MODEL, device=device, compute_type=compute, device_index=0)
+
 
 def _fmt_srt_time(t: float) -> str:
     if t < 0: t = 0.0
@@ -329,7 +348,7 @@ def _process_task(task_id: str):
                     use_auth_token=PYANNOTE_TOKEN or None
                 )
                 # 确保 _resolve_device 返回 torch.device（前面已修过）
-                pipeline.to(_resolve_device())
+                pipeline.to(_device_for_pyannote())
                 # 给 pyannote 用规范化后的 wav（更稳）
                 wav_for_diar = _safe_wav_for_diar(norm_audio)
                 diar = pipeline(wav_for_diar)
