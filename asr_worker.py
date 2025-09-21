@@ -30,6 +30,13 @@ lock = threading.Lock()
 
 app.mount("/results", StaticFiles(directory=RESULT_DIR), name="results")
 
+def _append_log(task, msg):
+    task.setdefault("logs", []).append(str(msg))
+
+def _fail_task(task, msg):
+    task["status"] = "failed"
+    _append_log(task, f"fatal: {msg}")
+
 def _resolve_device():
     import os, torch
     dev = (os.environ.get("DEVICE") or "").lower().strip()
@@ -100,6 +107,23 @@ def _safe_wav_for_diar(original_path: str) -> str:
         return original_path
 
 
+def to_wav16k_mono(src_path: str) -> str:
+    """将任意音频转成 16k/mono WAV；ffmpeg 不在则原样返回。"""
+    if not shutil.which("ffmpeg"):
+        return src_path
+    tmpdir = tempfile.mkdtemp(prefix="wav16k_")
+    out = os.path.join(tmpdir, "audio_16k_mono.wav")
+    cmd = ["ffmpeg", "-y", "-i", src_path, "-ac", "1", "-ar", "16000", "-vn", out]
+    try:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
+        return out
+    except subprocess.CalledProcessError as e:
+        # 记录 ffmpeg stderr，便于排错
+        with lock:
+            _append_log(tasks[task_id], f"ffmpeg_failed: {e.stderr.decode(errors='ignore')[:300]}")
+        return src_path
+
+
 class StartBody(BaseModel):
     audio_url: str
     series_id: Optional[str] = ""
@@ -131,7 +155,10 @@ def asr_upload(request: Request, file: UploadFile = File(...)):
     path = os.path.join(UPLOAD_DIR, f"{task_id}{ext}")
     with open(path, "wb") as f: f.write(file.file.read())
     with lock:
-        tasks[task_id] = {"status":"queued","progress":0,"request":request, "audio_path":path}
+        t = tasks[task_id]
+        t["status"] = "queued"
+        t["progress"] = 5
+        _append_log(t, f"upload_ok: path={save_path}, size={os.path.getsize(save_path)}B")
     threading.Thread(target=_process_task, args=(task_id,), daemon=True).start()
     return {"task_id": task_id, "status": "queued"}
 
@@ -174,29 +201,71 @@ def asr_result(task_id: str):
         return t["result"]
 
 def _process_task(task_id: str):
+    norm_audio = to_wav16k_mono(audio_path)
+    with lock:
+        _append_log(tasks[task_id], f"audio_prepared: {norm_audio}")
+
     try:
         with lock:
             t = tasks[task_id]
             t["status"] = "processing"; t["progress"] = 5
-            audio_path = t["audio_path"]; req = t.get("request")
+            audio_path = t["audio_path"]
+            req = t.get("request")
             ctx_prompt = t.get("context_prompt") or None
 
+        # ====== 模拟分支 ======
         if SIMULATE:
             time.sleep(SIM_DELAY)
-            demo = [{"start":0,"end":3,"text":"模拟-欢迎","speaker":"SPK_00"},
-                    {"start":3,"end":7,"text":"模拟-讨论","speaker":"SPK_00"},
-                    {"start":7,"end":11,"text":"模拟-总结","speaker":"SPK_01"}]
+            demo = [
+                {"start":0,"end":3,"text":"模拟-欢迎","speaker":"SPK_00"},
+                {"start":3,"end":7,"text":"模拟-讨论","speaker":"SPK_00"},
+                {"start":7,"end":11,"text":"模拟-总结","speaker":"SPK_01"},
+            ]
             srt_path  = os.path.join(RESULT_DIR, f"{task_id}.srt")
             json_path = os.path.join(RESULT_DIR, f"{task_id}.json")
             _write_srt(demo, srt_path)
-            _save_json({"task_id":task_id,"segments":demo}, json_path)
+            _save_json({"task_id": task_id, "segments": demo}, json_path)
             with lock:
-                tasks[task_id]["status"]="succeeded"; tasks[task_id]["progress"]=100
-                tasks[task_id]["result"]={
-                    "aligned_preview":"\n".join(((f"[{d['speaker']}] " if d.get('speaker') else "")+d['text']).strip() for d in demo),
-                    "srt_url": _public_url(req, srt_path), "json_url": _public_url(req, json_path)
+                tasks[task_id]["status"] = "succeeded"
+                tasks[task_id]["progress"] = 100
+                tasks[task_id]["result"] = {
+                    "aligned_preview": "\n".join(
+                        ((f"[{d['speaker']}] " if d.get('speaker') else "") + d['text']).strip()
+                        for d in demo
+                    ),
+                    "srt_url": _public_url(req, srt_path),
+                    "json_url": _public_url(req, json_path),
                 }
             return
+
+        # ====== 实际处理分支 ======
+        try:
+            with lock:
+                _append_log(tasks[task_id], "stage=prepare_audio")
+
+            norm_audio = to_wav16k_mono(audio_path)
+            with lock:
+                _append_log(tasks[task_id], f"audio_prepared: {norm_audio}")
+                tasks[task_id]["progress"] = 15
+
+            # ... 在这里跑 Whisper ASR ...
+            # ... 在这里跑 diarization（带 _resolve_device 修复）...
+            # ... 在这里跑 finalize_segments, _write_srt, _save_json ...
+
+            with lock:
+                tasks[task_id]["status"] = "succeeded"
+                tasks[task_id]["progress"] = 100
+                _append_log(tasks[task_id], "done")
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc(limit=2)
+            with lock:
+                _fail_task(tasks[task_id], f"{type(e).__name__}: {e}")
+                _append_log(tasks[task_id], tb)
+
+    except Exception as e:
+        # 极端情况：tasks[task_id] 自身取不到
+        return
 
         # 1) ASR
         from faster_whisper import WhisperModel
