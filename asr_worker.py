@@ -1,10 +1,9 @@
-import os, json, uuid, time, threading, torch
+import os, json, uuid, time, threading, torch, requests, subprocess, shutil, tempfile, os, re
 from typing import Dict, Any, Optional, List, Tuple
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-import requests
-import subprocess, shutil, tempfile, os, re
+import numpy as np
 from uuid import uuid4
 from modules.text_clean import clean_text
 from modules.align import finalize_segments, assign_speaker_to_words, renumber_speakers_by_first_appearance
@@ -277,23 +276,143 @@ def asr_result(task_id: str):
         return t["result"]
 
 def _process_task(task_id: str):
-    # ---------- 0) 取任务&关键字段 ----------
+    """
+    新版处理流程（最小侵入）：
+      1) 统一音频 -> norm_audio
+      2) WhisperX: 文本 + 高精度词级时间戳
+      3) Pyannote: 说话人 -> 10ms 帧级标签（含轻量平滑）
+      4) 词级多数派赋 speaker
+      5) finalize_segments（你 modules/align.py 的覆盖版）
+      6) 强清洗 -> SRT/JSON/预览 -> 返回
+    """
+    import os, time, json, re, numpy as np
+    from typing import List, Dict, Any, Tuple
+    import threading
+
+    # ---- 工具 ----
+    def _append(t, msg): 
+        try:
+            _append_log(t, msg)
+        except Exception:
+            pass
+
+    # 强清洗（零宽/控制符）
+    INVIS_RE = re.compile(r"[\x00-\x08\x0B-\x0C\x0E-\x1F\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]")
+    def _strip_invisibles(s: str) -> str:
+        return INVIS_RE.sub("", s or "")
+
+    # A. WhisperX：ASR + 对齐，取高精度词级时间戳
+    def transcribe_with_whisperx(audio_path, device="cuda", batch_size=16, lang=None, initial_prompt=None):
+        import whisperx
+        # 模型加载
+        model = whisperx.load_model(
+            "large-v3", device,
+            compute_type=("float16" if device == "cuda" else "int8")
+        )
+        asr = model.transcribe(
+            audio_path, batch_size=batch_size,
+            language=lang, initial_prompt=initial_prompt
+        )
+        # 对齐模型
+        align_model, metadata = whisperx.load_align_model(
+            language_code=asr["language"], device=device
+        )
+        aligned = whisperx.align(
+            asr["segments"], align_model, metadata,
+            audio_path, device=device, return_char_alignments=False
+        )
+        words = []
+        for seg in aligned.get("segments", []):
+            for w in seg.get("words", []):
+                if w.get("start") is None or w.get("end") is None:
+                    continue
+                txt = (w.get("text") or "").strip()
+                if not txt:
+                    continue
+                words.append({
+                    "start": float(w["start"]),
+                    "end": float(w["end"]),
+                    "text": txt
+                })
+        return words, asr
+
+    # B. Diarization：转为 10ms 帧级说话人标签 + 轻量平滑
+    def diarize_to_frames(audio_path, device="cuda", num_speakers=None, min_spk=2, max_spk=5, frame_hop=0.01):
+        from pyannote.audio import Pipeline
+        pipeline = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1",
+            use_auth_token=os.environ.get("PYANNOTE_TOKEN", None)
+        )
+        if num_speakers is not None:
+            diar = pipeline(audio_path, num_speakers=num_speakers)
+        else:
+            diar = pipeline(audio_path, min_speakers=min_spk, max_speakers=max_spk)
+
+        # 全时长
+        total_end = 0.0
+        for turn, _, _ in diar.itertracks(yield_label=True):
+            total_end = max(total_end, float(turn.end))
+        T = int(np.ceil(total_end / frame_hop))
+        frames = [None] * T
+
+        # 简化赋值：后写覆盖；需要更严谨可统计每帧各 spk 时长再 argmax
+        for turn, _, spk in diar.itertracks(yield_label=True):
+            s = int(np.floor(float(turn.start) / frame_hop))
+            e = int(np.ceil(float(turn.end)   / frame_hop))
+            for t in range(max(0, s), min(T, e)):
+                frames[t] = spk
+
+        # 轻量平滑：吸收 <120ms 的瞬时切换（连续性惩罚）
+        smooth = []
+        last = None
+        run = 0
+        min_run = int(0.12 / frame_hop)
+        for t in range(T):
+            cur = frames[t]
+            if cur == last:
+                run += 1
+            else:
+                if run > 0 and run < min_run and len(smooth) > run:
+                    for k in range(run):
+                        smooth[-1 - k] = smooth[-1 - run]  # 回填为上上个说话人
+                last = cur
+                run = 1
+            smooth.append(last)
+        return smooth, frame_hop
+
+    # C. 词级多数派赋 speaker（用帧标签投票）
+    def assign_speaker_by_frames(words: List[Dict[str, Any]], frame_labels, hop=0.01):
+        out = []
+        nF = len(frame_labels)
+        for w in words:
+            ws, we = float(w["start"]), float(w["end"])
+            s = max(0, int(ws / hop))
+            e = max(s, int(np.ceil(we / hop)))
+            votes = {}
+            for t in range(s, min(e, nF)):
+                spk = frame_labels[t]
+                if spk is None:
+                    continue
+                votes[spk] = votes.get(spk, 0) + 1
+            spk = max(votes.items(), key=lambda x: x[1])[0] if votes else None
+            out.append({**w, "speaker": spk})
+        return out
+
+    # ---------- 0) 取任务 ----------
     try:
         with lock:
             t = tasks.get(task_id)
             if not t:
                 return
-            t["status"] = "processing"
-            t["progress"] = 5
+            t["status"] = "processing"; t["progress"] = 5
             audio_path = t.get("audio_path")
             req = t.get("request")
             ctx_prompt = t.get("context_prompt") or None
-            _append_log(t, "start_processing")
+            _append(t, "start_processing")
             if not audio_path or not os.path.exists(audio_path):
                 _fail_task(t, f"audio_missing: {audio_path}")
                 return
     except Exception:
-        # 极端：tasks 取不到
         return
 
     # ---------- 1) 模拟分支 ----------
@@ -301,167 +420,122 @@ def _process_task(task_id: str):
         try:
             time.sleep(SIM_DELAY)
             demo = [
-                {"start": 0, "end": 3, "text": "模拟-欢迎", "speaker": "SPK_00"},
-                {"start": 3, "end": 7, "text": "模拟-讨论", "speaker": "SPK_00"},
-                {"start": 7, "end": 11, "text": "模拟-总结", "speaker": "SPK_01"},
+                {"start": 0, "end": 3, "text": "模拟-欢迎", "speaker": "SPEAKER_00"},
+                {"start": 3, "end": 7, "text": "模拟-讨论", "speaker": "SPEAKER_00"},
+                {"start": 7, "end": 11, "text": "模拟-总结", "speaker": "SPEAKER_01"},
             ]
             srt_path  = os.path.join(RESULT_DIR, f"{task_id}.srt")
             json_path = os.path.join(RESULT_DIR, f"{task_id}.json")
             os.makedirs(RESULT_DIR, exist_ok=True)
             _write_srt(demo, srt_path)
             _save_json({"task_id": task_id, "segments": demo}, json_path)
-            preview = "\n".join(
-                ((f"[{d.get('speaker')}] " if d.get('speaker') else "") + d["text"]).strip()
-                for d in demo
-            ).strip()
+            preview = "\n".join(((f"[{d.get('speaker')}] " if d.get('speaker') else "") + d["text"]).strip() for d in demo).strip()
             with lock:
                 t = tasks[task_id]
-                t["status"] = "succeeded"
-                t["progress"] = 100
+                t["status"] = "succeeded"; t["progress"] = 100
                 t["result"] = {
                     "aligned_preview": preview,
                     "srt_url": _public_url(req, srt_path),
                     "json_url": _public_url(req, json_path),
+                    "segments": demo,
                 }
-                _append_log(t, "done (simulate)")
+                _append(t, "done (simulate)")
         except Exception as e:
             import traceback
             tb = traceback.format_exc(limit=2)
             with lock:
                 t = tasks.get(task_id) or {}
                 _fail_task(t, f"{type(e).__name__}: {e}")
-                _append_log(t, tb)
-        return  # 模拟分支结束
+                _append(t, tb)
+        return
 
-    # ---------- 2) 实际处理分支 ----------
+    # ---------- 2) 实际处理 ----------
     try:
-        # 2.1 预处理音频：统一成 16k/mono，避免 m4a 早期失败
+        # 2.1 统一音频
         with lock:
-            t = tasks[task_id]
-            _append_log(t, "stage=prepare_audio")
-            t["progress"] = 10
+            t = tasks[task_id]; t["progress"] = 10; _append(t, "stage=prepare_audio")
         norm_audio = to_wav16k_mono(audio_path)
         with lock:
-            t = tasks[task_id]
-            _append_log(t, f"audio_prepared: {norm_audio}")
-            t["progress"] = 15
+            t = tasks[task_id]; t["progress"] = 15; _append(t, f"audio_prepared: {norm_audio}")
 
-        # 2.2 ASR（faster-whisper）
+        # 2.2 WhisperX 对齐（高精度词时间戳）
         with lock:
-            t = tasks[task_id]
-            _append_log(t, "stage=asr_start")
-            t["progress"] = 25
-        model = _asr_load_model()  # 你已有的加载函数
-        segments, info = model.transcribe(
-            norm_audio,
-            vad_filter=True,
-            word_timestamps=True,
-            initial_prompt=ctx_prompt,
-            language=None,
-            condition_on_previous_text=False,
-            temperature=0.0,
-            beam_size=5,  # ← 新增：小 beam 提升边界稳定（速度 OK）
+            t = tasks[task_id]; t["progress"] = 25; _append(t, "stage=asr_whisperx_start")
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        words, asr_raw = transcribe_with_whisperx(
+            norm_audio, device=device, batch_size=16,
+            lang=None, initial_prompt=ctx_prompt
         )
-        words: List[Dict[str, Any]] = []
-        for seg in segments:
-            if seg.words:
-                for w in seg.words:
-                    words.append({"start": float(w.start), "end": float(w.end), "text": w.word})
         with lock:
-            t = tasks[task_id]
-            _append_log(t, f"stage=asr_done: words={len(words)}")
-            t["progress"] = 55
+            t = tasks[task_id]; t["progress"] = 40; _append(t, f"asr_words={len(words)} device={device}")
 
-        # 2.3 Diarization（失败不致命）
-        diar_turns: List[Tuple[float, float, str]] = []
-        enable_diar = (DIARIZE == "on") or (DIARIZE == "auto" and PYANNOTE_TOKEN)
+        # 2.3 Diarization -> 10ms 帧（人数优先取环境变量）
         with lock:
-            t = tasks[task_id]
-            _append_log(t, f"diarization_enable={enable_diar} (DIARIZE={DIARIZE}, token={'yes' if PYANNOTE_TOKEN else 'no'})")
+            t = tasks[task_id]; _append(t, f"stage=diar_frames_start (token={'yes' if os.environ.get('PYANNOTE_TOKEN') else 'no'})")
+        num_spk_env = os.environ.get("DIAR_NUM_SPEAKERS")
+        num_spk = int(num_spk_env) if (num_spk_env or "").isdigit() else None
         try:
-            if enable_diar:
-                from pyannote.audio import Pipeline
-                pipeline = Pipeline.from_pretrained(
-                    "pyannote/speaker-diarization-3.1",
-                    use_auth_token=PYANNOTE_TOKEN or None
-                )
-                # 确保 _resolve_device 返回 torch.device（前面已修过）
-                pipeline.to(_device_for_pyannote())
-                # 给 pyannote 用规范化后的 wav（更稳）
-                wav_for_diar = _safe_wav_for_diar(norm_audio)
-                diar = pipeline(wav_for_diar,num_speakers=3)
-                for turn, _, speaker in diar.itertracks(yield_label=True):
-                    diar_turns.append((float(turn.start), float(turn.end), str(speaker)))
-                with lock:
-                    t = tasks[task_id]
-                    _append_log(t, f"diarization_ok: turns={len(diar_turns)}")
-                    t["progress"] = 75
-            else:
-                with lock:
-                    t = tasks[task_id]
-                    _append_log(t, "diarization_skipped")
-        except Exception as e:
-            import traceback
-            tb = traceback.format_exc(limit=1)
+            frame_labels, hop = diarize_to_frames(
+                norm_audio, device=device, num_speakers=num_spk,
+                min_spk=2, max_spk=5, frame_hop=0.01
+            )
             with lock:
-                t = tasks[task_id]
-                _append_log(t, f"diarization_failed: {type(e).__name__}: {e}")
-                _append_log(t, tb)
-            diar_turns = []  # 不中断
+                t = tasks[task_id]; t["progress"] = 60; _append(t, f"diar_frames_ok: T={len(frame_labels)} hop={hop}")
+        except Exception as e:
+            # diarization 失败不致命：全部 None
+            frame_labels, hop = [], 0.01
+            with lock:
+                t = tasks[task_id]; _append(t, f"diar_frames_failed: {type(e).__name__}: {e}")
 
-        # ★ 2.4 逐词贴 speaker → 合并（遇 speaker 变化就切段）→ 重命名 → 清洗
+        # 2.4 词级多数派赋 speaker
+        if frame_labels:
+            words_spk = assign_speaker_by_frames(words, frame_labels, hop)
+        else:
+            # 无帧信息则保持 None（finalize 会尽力做）
+            words_spk = [{**w, "speaker": None} for w in words]
         with lock:
-            t = tasks[task_id]
-            _append_log(t, "stage=align_start")
+            t = tasks[task_id]; t["progress"] = 70; _append(t, "word_speakers_assigned_by_frames")
 
-        # 给每个词打上 speaker（若 diar 失败则全为 None）
-        words = assign_speaker_to_words(words, diar_turns)
+        # 2.5 词->句 段落生成（使用你 modules/align.py 的 finalize_segments）
+        from modules.align import finalize_segments
+        final_segments = finalize_segments(words_spk, diar_turns=[], lang_hint="zh")
+        with lock:
+            t = tasks[task_id]; t["progress"] = 80; _append(t, f"finalize_done: segs={len(final_segments)}")
 
-        # 合并（确保 finalize_segments 尊重 word['speaker'] 边界）
-        final_segments = finalize_segments(words, diar_turns, lang_hint="zh")
-        
-        # 让第一个开口的人从 SPEAKER_00 开始
-        final_segments = renumber_speakers_by_first_appearance(final_segments)
-
-
-        # 文本清洗：去零宽 + 你已有的 clean_text
+        # 2.6 强清洗（必须在写盘/返回前）
+        from modules.text_clean import clean_text  # 你现有的清洗
         for seg in final_segments:
             seg["text"] = _strip_invisibles(seg["text"])
             seg["text"] = clean_text(seg["text"], lang_hint="auto")
-
-        # 过滤空段（可选）
         final_segments = [s for s in final_segments if s["text"]]
 
-
-
-        # 2.5 写出 SRT/JSON
+        # 2.7 写盘
         srt_path  = os.path.join(RESULT_DIR, f"{task_id}.srt")
         json_path = os.path.join(RESULT_DIR, f"{task_id}.json")
         os.makedirs(RESULT_DIR, exist_ok=True)
         _write_srt(final_segments, srt_path)
         _save_json({"task_id": task_id, "segments": final_segments}, json_path)
 
+        # 2.8 预览 + 返回
         preview = "\n".join(
-            ((f"[{s.get('speaker')}] " if s.get("speaker") else "") + s["text"]).strip()
+            ((f"[{s.get('speaker')}] " if s.get('speaker') else "") + s["text"]).strip()
             for s in final_segments[:12]
         ).strip()
-
         with lock:
             t = tasks[task_id]
             t["result"] = {
                 "aligned_preview": preview,
                 "srt_url": _public_url(req, srt_path),
                 "json_url": _public_url(req, json_path),
-                "segments": final_segments,          # ← 新增：直接带回分段
+                "segments": final_segments,
             }
-            t["status"] = "succeeded"
-            t["progress"] = 100
-            _append_log(t, "done")
-
+            t["status"] = "succeeded"; t["progress"] = 100
+            _append(t, "done")
     except Exception as e:
         import traceback
         tb = traceback.format_exc(limit=3)
         with lock:
             t = tasks.get(task_id) or {}
             _fail_task(t, f"{type(e).__name__}: {e}")
-            _append_log(t, tb)
+            _append(t, tb)
