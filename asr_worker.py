@@ -302,39 +302,71 @@ def _process_task(task_id: str):
         return INVIS_RE.sub("", s or "")
 
     # A. WhisperX：ASR + 对齐，取高精度词级时间戳
-    def transcribe_with_whisperx(audio_path, device="cuda", batch_size=16, lang=None, initial_prompt=None):
+    def transcribe_with_whisperx(
+        audio_path: str,
+        model_name: str,
+        device: str,
+        compute_type: str = "float16",
+        lang_hint: Optional[str] = None,
+        ctx_prompt: Optional[str] = None,  # 注意：whisperx 不支持 initial_prompt，这个参数仅占位
+    ):
+        """
+        用 whisperx 做转写 + 对齐，返回 (words, asr_raw)
+        - whisperx 的 FasterWhisperPipeline.transcribe 不支持 initial_prompt
+        - lang_hint: "zh" / "en" / None ；None 时让 whisperx 自动检测
+        """
         import whisperx
-        # 模型加载
-        model = whisperx.load_model(
-            "large-v3", device,
-            compute_type=("float16" if device == "cuda" else "int8")
-        )
+        import torch
+
+        # 1) 加载 ASR 模型
+        # whisperx 3.3.1：compute_type 建议 "float16" (CUDA) / "int8" (CPU)
+        if device == "cuda":
+            ct = "float16" if "float16" in compute_type else "int8_float16"
+        else:
+            ct = "int8"
+
+        model = whisperx.load_model(model_name, device, compute_type=ct)
+
+        # 2) 转写（无 initial_prompt）
+        # 仅传入 whisperx 支持的参数：language / task / batch_size / vad / chunk_size / print_progress
         asr = model.transcribe(
-            audio_path, batch_size=batch_size,
-            language=lang, initial_prompt=initial_prompt
+            audio_path,
+            language=(None if (not lang_hint or lang_hint == "auto") else lang_hint),
+            task="transcribe",
+            batch_size=8,
+            vad=True,
+            print_progress=False,
         )
-        # 对齐模型
-        align_model, metadata = whisperx.load_align_model(
-            language_code=asr["language"], device=device
+        # asr 结构里含 'segments' 和 'language'
+        detected_lang = asr.get("language") or (lang_hint if lang_hint and lang_hint != "auto" else None)
+
+        # 3) 词级对齐（whisperx 内置）
+        # 语言代码给 align_model 用：whisperx 需要两位/ISO 代码，如 'zh'、'en'
+        am, meta = whisperx.load_align_model(
+            language_code=(detected_lang or "zh"),  # 兜底 zh，避免有些短音频未返 language
+            device=device,
         )
-        aligned = whisperx.align(
-            asr["segments"], align_model, metadata,
-            audio_path, device=device, return_char_alignments=False
-        )
+        aligned = whisperx.align(asr["segments"], am, meta, audio_path, device)
+
+        # 4) 输出 words（兼容你后面的 finalize 流程）
         words = []
         for seg in aligned.get("segments", []):
-            for w in seg.get("words", []):
-                if w.get("start") is None or w.get("end") is None:
-                    continue
-                txt = (w.get("text") or "").strip()
-                if not txt:
-                    continue
-                words.append({
-                    "start": float(w["start"]),
-                    "end": float(w["end"]),
-                    "text": txt
-                })
-        return words, asr
+            for w in seg.get("words", []) or []:
+                # 过滤无时间戳或空 token
+                if w.get("word") and (w.get("start") is not None) and (w.get("end") is not None):
+                    words.append({
+                        "start": float(w["start"]),
+                        "end": float(w["end"]),
+                        "text": w["word"],
+                    })
+
+        # 5) 返回 “原始 asr+对齐结果”（便于调试/保存）
+        asr_raw = {
+            "language": detected_lang,
+            "segments": aligned.get("segments", asr.get("segments", [])),
+        }
+
+        return words, asr_raw
 
     # B. Diarization：转为 10ms 帧级说话人标签 + 轻量平滑
     def diarize_to_frames(audio_path, device="cuda", num_speakers=None, min_spk=2, max_spk=5, frame_hop=0.01):
@@ -464,8 +496,8 @@ def _process_task(task_id: str):
         import torch
         device = "cuda" if torch.cuda.is_available() else "cpu"
         words, asr_raw = transcribe_with_whisperx(
-            norm_audio, device=device, batch_size=16,
-            lang=None, initial_prompt=ctx_prompt
+            norm_audio, WHISPER_MODEL, device, compute_type=COMPUTE_TYPE,
+            lang_hint=lang_hint, ctx_prompt=ctx_prompt
         )
         with lock:
             t = tasks[task_id]; t["progress"] = 40; _append(t, f"asr_words={len(words)} device={device}")
