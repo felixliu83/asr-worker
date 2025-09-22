@@ -8,7 +8,6 @@ import string
 
 __all__ = [
     "finalize_segments",
-    # 单项工具（若外部需要可引用）
     "merge_ascii_fragments",
     "assign_speaker_to_words",
     "smooth_word_speakers",
@@ -19,32 +18,37 @@ __all__ = [
     "revote_segment_speaker_by_overlap",
     "revote_segment_by_word_majority",
     "tweak_pingpong_boundaries",
+    "snap_tail_char_to_next",
+    "enforce_speaker_continuity",
     "renumber_speakers_by_first_appearance",
 ]
 
 # -------------------- 可调参数 --------------------
 
 # 英文碎片合并（修复 I sa ac -> Isaac）
-ASCII_MAX_GAP = 0.20
+ASCII_MAX_GAP = 0.18   # 更贴近你数据里英文 token 的节奏
 ASCII_MAX_PIECES = 3
 
 # 词层说话人：最大重叠 + 滑窗平滑 + 边界吸附
 SMOOTH_WINDOW_SEC       = 0.40
-BOUNDARY_SNAP_WINDOW    = 0.40   # ↑ 针对问答边界适度加大
+BOUNDARY_SNAP_WINDOW    = 0.40
 BOUNDARY_MAX_TOKEN_DUR  = 0.30
 
-# 词→句 切段策略
-MAX_INTER_WORD_GAP = 0.35        # ↓ 短停顿就切，适合密集问答
-MAX_SEG_DUR        = 5.0         # ↓ 避免一段过长
+# 词→句 切段策略（密集问答专用）
+MAX_INTER_WORD_GAP = 0.33   # 稍微更敏感，短停顿就切
+MAX_SEG_DUR        = 5.0
 PUNCT_BREAK_RE = re.compile(r"[。！？!?]|(\.\s)|[.…]+")
 
 # 片段后处理
 SAME_SPK_MERGE_SHORT = 0.30
-JITTER_ABSORB_DUR    = 0.16      # 吸收瞬间误切（A|B|A 中的短 B）
+JITTER_ABSORB_DUR    = 0.15  # 略降，减少吞掉真实短答
 
 # 重投票（段级）
-IOU_MARGIN          = 0.06       # ↓ 更容易把错段纠正过来
+IOU_MARGIN          = 0.06
 WORD_MAJORITY_RATIO = 0.55
+
+# 句内黏连：数字 + 单位（避免“11 | 岁”被拆）
+UNIT_CHS = ("岁", "年", "个", "次", "号")
 
 # -------------------- 小工具 --------------------
 
@@ -62,6 +66,9 @@ def _is_ascii_alpha(s: str) -> bool:
 
 def _is_ascii(s: str) -> bool:
     return all(ord(c) < 128 for c in s)
+
+def _endswith_number(s: str) -> bool:
+    return bool(re.search(r"[0-9０-９]+$", s))
 
 # -------------------- 1) 英文碎片合并 --------------------
 
@@ -100,7 +107,7 @@ def merge_ascii_fragments(words: List[Dict[str, Any]],
         i += 1
     return out
 
-# -------------------- 2) 词层说话人：最大重叠 + 平滑 + 边界吸附 --------------------
+# -------------------- 2) 词层说话人：最大重叠 → 平滑 → 边界吸附 --------------------
 
 def assign_speaker_to_words(words: List[Dict[str, Any]],
                             turns: List[Tuple[float, float, str]]) -> List[Dict[str, Any]]:
@@ -180,7 +187,7 @@ def fix_boundary_tokens(words: List[Dict[str, Any]],
             w["speaker"] = spk_after
     return words
 
-# -------------------- 3) 词→句：换人=硬切 + 语言边界软切 --------------------
+# -------------------- 3) 词→句：换人=硬切 + 语言边界软切 + 句内黏连 --------------------
 
 def merge_words_to_segments(words: List[Dict[str, Any]],
                             *,
@@ -229,7 +236,15 @@ def merge_words_to_segments(words: List[Dict[str, Any]],
         cur["end"] = we
         cur["text"] = _smart_join(cur["text"], txt)
 
-        # 3.1 语言边界软切：ASCII ↔ 非 ASCII 且 gap 很小
+        # 3.1 数字 + 单位：句内强黏连（避免“11 | 岁”被拆）
+        if spk == cur.get("speaker") and gap <= 0.18:
+            tail8 = cur["text"][-8:]
+            if _endswith_number(tail8) and (txt in UNIT_CHS):
+                # 已在同一段，无需切段；阻止随后的软切
+                last_end = we
+                continue
+
+        # 3.2 语言边界软切：ASCII ↔ 非 ASCII 且 gap 很小
         if (_is_ascii(txt) != _is_ascii(prev_tail)) and gap <= 0.18:
             flush()
             last_end = we
@@ -248,7 +263,7 @@ def merge_words_to_segments(words: List[Dict[str, Any]],
     flush()
     return segs
 
-# -------------------- 4) 片段后处理：合并 + 抖动吸收 --------------------
+# -------------------- 4) 片段后处理：合并 + 抖动吸收 + 段层边界吸附 --------------------
 
 def merge_short_segments_same_speaker(segments: List[Dict[str, Any]],
                                       min_dur: float = SAME_SPK_MERGE_SHORT) -> List[Dict[str, Any]]:
@@ -279,13 +294,38 @@ def absorb_jitter_switches(segments: List[Dict[str, Any]],
         if (cur.get("speaker") != prev.get("speaker")
             and nxt.get("speaker") == prev.get("speaker")
             and cur_dur < max_jitter):
-            # 吸回：合并到前后同 speaker 的大段
             prev["end"] = nxt["end"]
             prev["text"] = _smart_join(prev["text"], cur["text"])
             prev["text"] = _smart_join(prev["text"], nxt["text"])
             out.pop(i + 1)
             out.pop(i)
             continue
+        i += 1
+    return out
+
+def snap_tail_char_to_next(segments: List[Dict[str, Any]], max_move: float = 0.22) -> List[Dict[str, Any]]:
+    """
+    若上一段结束与下一段开始间隔很小，且后一段说话人不同，
+    将“极短末尾段/字”并入后一段，修复‘末尾一个字黏前句’的问题。
+    """
+    if len(segments) < 2:
+        return segments
+    out: List[Dict[str, Any]] = []
+    i = 0
+    while i < len(segments):
+        if i + 1 < len(segments):
+            a, b = segments[i], segments[i + 1]
+            gap = float(b["start"]) - float(a["end"])
+            a_dur = float(a["end"]) - float(a["start"])
+            if 0 <= gap <= max_move and a.get("speaker") != b.get("speaker") and a_dur <= 0.28:
+                # 把 A 并入 B
+                b["start"] = a["start"]
+                b["text"] = (a["text"] + " " + b["text"]).strip()
+                i += 1  # 吞掉 A
+            else:
+                out.append(a)
+        else:
+            out.append(segments[i])
         i += 1
     return out
 
@@ -340,7 +380,7 @@ def revote_segment_by_word_majority(segments: List[Dict[str, Any]],
         out.append(seg)
     return out
 
-# -------------------- 6) 微调问答 ping-pong 的边界 --------------------
+# -------------------- 6) 问答 ping-pong 的边界微调 + 连续性惩罚 --------------------
 
 def tweak_pingpong_boundaries(segments: List[Dict[str, Any]],
                               max_pair_dur: float = 0.60,
@@ -354,7 +394,6 @@ def tweak_pingpong_boundaries(segments: List[Dict[str, Any]],
             da = float(a["end"]) - float(a["start"])
             db = float(b["end"]) - float(b["start"])
             if da <= max_pair_dur and db <= max_pair_dur:
-                # A|B|A：把两条边界各右移一丢丢，帮助尾字/首字归位
                 new_ab = min(a["end"] + shift, b["end"] - 0.01)
                 a["end"] = new_ab
                 b["start"] = new_ab
@@ -363,6 +402,27 @@ def tweak_pingpong_boundaries(segments: List[Dict[str, Any]],
                     b["end"] = new_bc
                     c["start"] = new_bc
     return segs
+
+def enforce_speaker_continuity(segments: List[Dict[str, Any]], penalty: float = 0.12) -> List[Dict[str, Any]]:
+    """
+    连续性惩罚：若尝试把 seg[i] 的说话人从 prev 改为新说话人，只有当“切换收益”大于 penalty 才允许。
+    这里用一个简化平滑度指标（基于相邻间隙和段长）做代理，足以抑制无意义漂号。
+    """
+    if not segments:
+        return segments
+    out = [segments[0]]
+    for i in range(1, len(segments)):
+        prev, cur = out[-1], dict(segments[i])
+        if cur.get("speaker") == prev.get("speaker"):
+            out.append(cur)
+            continue
+        gap = float(cur["start"]) - float(prev["end"])
+        dur = float(cur["end"]) - float(cur["start"])
+        smooth = max(0.0, min(0.3, gap)) / max(0.3, dur)  # 越大代表越“有理”的切换
+        if smooth < penalty:
+            cur["speaker"] = prev.get("speaker")
+        out.append(cur)
+    return out
 
 # -------------------- 7) 重命名 --------------------
 
@@ -379,12 +439,12 @@ def renumber_speakers_by_first_appearance(segments: List[Dict[str, Any]]) -> Lis
         seg["speaker"] = mapping[spk]
     return segments
 
-# -------------------- 入口 --------------------
+# -------------------- 入口：Finalize --------------------
 
 def finalize_segments(words: List[Dict[str, Any]],
                       diar_turns: List[Tuple[float, float, str]],
                       lang_hint: str = "auto") -> List[Dict[str, Any]]:
-    # 0) 英文碎片合并
+    # 0) 英文碎片合并（I sa ac -> Isaac）
     words = merge_ascii_fragments(words, max_gap=ASCII_MAX_GAP, max_pieces=ASCII_MAX_PIECES)
 
     # 1) 词层说话人：最大重叠 → 滑窗平滑 → 边界吸附
@@ -394,7 +454,7 @@ def finalize_segments(words: List[Dict[str, Any]],
                                 max_token_dur=BOUNDARY_MAX_TOKEN_DUR,
                                 snap_window=BOUNDARY_SNAP_WINDOW)
 
-    # 2) 词→句（换人=硬切 + 停顿/时长 + 语言边界软切）
+    # 2) 词→句（换人=硬切 + 停顿/时长 + 语言边界软切 + 数字单位黏连）
     sents = merge_words_to_segments(words,
                                     max_gap=MAX_INTER_WORD_GAP,
                                     max_dur=MAX_SEG_DUR)
@@ -402,12 +462,14 @@ def finalize_segments(words: List[Dict[str, Any]],
     # 3) 片段后处理
     sents = merge_short_segments_same_speaker(sents, min_dur=SAME_SPK_MERGE_SHORT)
     sents = absorb_jitter_switches(sents, max_jitter=JITTER_ABSORB_DUR)
+    sents = snap_tail_char_to_next(sents, max_move=0.22)  # ★ 末尾字归位（你的一号痛点）
 
     # 4) 段级重投票（IoU + 词多数）
     sents = revote_segment_speaker_by_overlap(sents, diar_turns, iou_margin=IOU_MARGIN)
     sents = revote_segment_by_word_majority(sents, words, majority_ratio=WORD_MAJORITY_RATIO)
 
-    # 5) 问答场景微调边界
+    # 5) 连续性惩罚 + 问答 ping-pong 微调
+    sents = enforce_speaker_continuity(sents, penalty=0.12)
     sents = tweak_pingpong_boundaries(sents, max_pair_dur=0.60, shift=0.08)
 
     # 6) 首现顺序重命名
