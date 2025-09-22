@@ -8,6 +8,7 @@ from uuid import uuid4
 from modules.text_clean import clean_text
 from modules.align import finalize_segments, assign_speaker_to_words, renumber_speakers_by_first_appearance
 from faster_whisper import WhisperModel
+from typing import Optional
 
 
 BASE_DIR      = os.environ.get("BASE_DIR", "./data")
@@ -490,6 +491,16 @@ def _process_task(task_id: str):
         with lock:
             t = tasks[task_id]; t["progress"] = 15; _append(t, f"audio_prepared: {norm_audio}")
 
+        lang_hint: Optional[str] = None
+        try:
+            # 若你在 /asr/upload 里把语言传进来了，可这样取：
+            lang_hint = t.get("lang_hint") or t.get("request", {}).get("lang_hint")
+        except Exception:
+            pass
+        if not lang_hint:
+            lang_hint = os.getenv("LANG_HINT", "auto")  # 'zh' / 'en' / 'auto'
+
+
         # 2.2 WhisperX 对齐（高精度词时间戳）
         with lock:
             t = tasks[task_id]; t["progress"] = 25; _append(t, "stage=asr_whisperx_start")
@@ -500,7 +511,7 @@ def _process_task(task_id: str):
             lang_hint=lang_hint, ctx_prompt=ctx_prompt
         )
         with lock:
-            t = tasks[task_id]; t["progress"] = 40; _append(t, f"asr_words={len(words)} device={device}")
+            t = tasks[task_id]; t["progress"] = 40; _append_log(tasks[task_id], f"asr_lang={asr_raw.get('language') or lang_hint}")
 
         # 2.3 Diarization -> 10ms 帧（人数优先取环境变量）
         with lock:
