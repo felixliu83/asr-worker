@@ -38,6 +38,36 @@ INVIS_RE = re.compile(r"[\x00-\x08\x0B-\x0C\x0E-\x1F\u200B-\u200F\u202A-\u202E\u
 def _strip_invisibles(s: str) -> str:
     return INVIS_RE.sub("", s or "")
 
+_WHISPERX = {}
+_ALIGN = {}
+_DIAR = None
+
+def _get_whisperx(model_name: str, device: str, compute_type: str):
+    import whisperx
+    key = (model_name, device, compute_type)
+    m = _WHISPERX.get(key)
+    if m is None:
+        m = whisperx.load_model(model_name, device, compute_type=compute_type)
+        _WHISPERX[key] = m
+    return m
+
+def _get_align(lang_code: str, device: str):
+    import whisperx
+    key = (lang_code, device)
+    v = _ALIGN.get(key)
+    if v is None:
+        v = whisperx.load_align_model(language_code=lang_code, device=device)
+        _ALIGN[key] = v
+    return v  # (am, meta)
+
+def _get_diar(pyannote_token: str | None, device: str):
+    import whisperx
+    global _DIAR
+    if _DIAR is None and pyannote_token:
+        _DIAR = whisperx.DiarizationPipeline(use_auth_token=pyannote_token, device=device)
+    return _DIAR
+
+
 
 def _device_for_pyannote():
     dev = (os.environ.get("DEVICE") or "auto").lower()
@@ -309,7 +339,7 @@ def _process_task(task_id: str):
         device: str = "cuda",
         compute_type: str = "float16",
         lang_hint: Optional[str] = None,
-        ctx_prompt: Optional[str] = None,  # 保留占位，不用传给 whisperx
+        ctx_prompt: Optional[str] = None,  # 占位，不传给 whisperx
         pyannote_token: Optional[str] = None,
         enable_diar: bool = True,
         batch_size: int = 16,
@@ -317,44 +347,47 @@ def _process_task(task_id: str):
         """
         返回:
         words: List[Dict]  每个词 {start, end, text, (speaker)}
-        asr_raw: Dict      包含 language/segments 等原始信息
+        asr_raw: Dict      包含 language/segments/diarization 等原始信息
         """
         import whisperx
 
-        # 1) 加载 WhisperX ASR
-        model = whisperx.load_model(model_name, device, compute_type=compute_type)
-
-        # 2) 语言：None=自动；否则用 zh/en/...
+        # 1) ASR
+        model = _get_whisperx(model_name, device, compute_type)
         language = None if (not lang_hint or lang_hint == "auto") else lang_hint
-
-        # 3) 转写（WhisperX 支持的参数很精简）
         asr = model.transcribe(
             audio_path,
-            language=language,          # None -> 自动检测
-            task="transcribe",          # or "translate"
-            batch_size=batch_size,      # 可按显存调
+            language=language,      # None -> 自动检测
+            task="transcribe",      # 或 "translate"
+            batch_size=batch_size,
         )
         detected_lang = asr.get("language") or language or "auto"
 
-        # 4) 对齐（CTC 对齐字级/词级时间）
-        #    兜底语言码：如果没自动出，就用 hint 或 zh
+        # 2) 对齐
         align_lang = (detected_lang if detected_lang != "auto" else (lang_hint or "zh"))
-        am, meta = whisperx.load_align_model(language_code=align_lang, device=device)
+        am, meta = _get_align(align_lang, device)
         aligned = whisperx.align(asr["segments"], am, meta, audio_path, device)
 
-        # 5) （可选）说话人分离，用 WhisperX 的 DiarizationPipeline
+        # 3) 组织为 dict，方便后续 diar/抽词（assign_word_speakers 需要 dict）
+        result_dict = {
+            "segments": aligned.get("segments", []),
+            "language": detected_lang,
+        }
+
+        # 4) 说话人分离（可选）
         diarize_segments = None
         if enable_diar and pyannote_token:
-            diar = whisperx.DiarizationPipeline(use_auth_token=pyannote_token, device=device)
-            diarize_segments = diar(audio_path)  # list of {"start","end","speaker"}
-            aligned["segments"] = whisperx.assign_word_speakers(diarize_segments, aligned["segments"])
+            diar = _get_diar(pyannote_token, device)
+            if diar is not None:
+                diarize_segments = diar(audio_path)  # list of {"start","end","speaker"}
+                # 关键：传 dict，不要传 list
+                result_dict = whisperx.assign_word_speakers(diarize_segments, result_dict)
 
-        # 6) 抽取词级
+        # 5) 抽取词级
         words: List[Dict[str, Any]] = []
-        for seg in aligned.get("segments", []):
+        for seg in result_dict.get("segments", []):
             spk = seg.get("speaker")
-            for w in seg.get("words", []) or []:
-                # WhisperX 的 word 里可能是 {"word": "...", "start": ..., "end": ...}
+            for w in (seg.get("words") or []):
+                # WhisperX word: {"word": "...", "start": ..., "end": ...}
                 if "word" in w and w.get("start") is not None and w.get("end") is not None:
                     item = {"start": float(w["start"]), "end": float(w["end"]), "text": w["word"]}
                     if spk:
@@ -362,11 +395,10 @@ def _process_task(task_id: str):
                     words.append(item)
 
         return words, {
-            "language": detected_lang,
-            "segments": aligned.get("segments", []),
+            "language": result_dict.get("language"),
+            "segments": result_dict.get("segments", []),
             "diarization": diarize_segments,
         }
-
 
     # B. Diarization：转为 10ms 帧级说话人标签 + 轻量平滑
     def diarize_to_frames(audio_path, device="cuda", num_speakers=None, min_spk=2, max_spk=5, frame_hop=0.01):
