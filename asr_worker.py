@@ -11,6 +11,7 @@ import shutil
 import logging
 import threading
 from typing import Any, Dict, List, Optional, Tuple
+import subprocess, tempfile, os, shutil
 
 import soundfile as sf
 import numpy as np
@@ -71,23 +72,71 @@ def _strip_invisibles(s: str) -> str:
     inv = re.compile(r"[\x00-\x08\x0B-\x0C\x0E-\x1F\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]")
     return inv.sub("", s)
 
-def to_wav16k_mono(src_path: str) -> str:
-    """统一到 16kHz/mono wav 临时文件（Whisper/WhisperX/pyannote 都稳）"""
-    data, sr = sf.read(src_path)
-    if data.ndim == 2:
-        data = data.mean(axis=1)
-    if sr != 16000:
-        # 重采样到 16k
-        import resampy
-        data = resampy.resample(data, sr, 16000)
-        sr = 16000
-    data = data.astype(np.float32)
-    tmp_dir = f"/tmp/wav16k_{uuid.uuid4().hex[:8]}"
-    os.makedirs(tmp_dir, exist_ok=True)
-    out = os.path.join(tmp_dir, "audio_16k_mono.wav")
-    sf.write(out, data, sr)
-    return out
+def _run(cmd: list, timeout: int = 600):
+    """运行子进程，报错时抛异常并带上stderr，便于排查。"""
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
+    if p.returncode != 0:
+        raise RuntimeError(f"cmd failed: {' '.join(cmd)}\n--- stderr ---\n{p.stderr}")
+    return p
 
+def _ffprobe_has_audio(path: str) -> bool:
+    """用 ffprobe 判断是否有音频流，避免喂错文件。"""
+    try:
+        cmd = [
+            "ffprobe", "-v", "error", "-select_streams", "a:0",
+            "-show_entries", "stream=codec_type", "-of", "default=noprint_wrappers=1:nokey=1",
+            path,
+        ]
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+        return ("audio" in (p.stdout or "")) and p.returncode == 0
+    except Exception:
+        return False
+
+def to_wav16k_mono(src_path: str) -> str:
+    """
+    用 ffmpeg 强制把任意格式（含 m4a/aac）转成 16k/mono 的 wav。
+    返回一个临时路径（/tmp/…/audio_16k_mono.wav）；调用者只需要用路径，不要去读内存。
+    """
+    if not os.path.exists(src_path):
+        raise FileNotFoundError(f"audio not found: {src_path}")
+
+    if not _ffprobe_has_audio(src_path):
+        # 给出更清晰的错误，方便你在 /asr/status 里定位到“文件没音频流/格式异常”
+        raise ValueError(f"no audio stream or unrecognized format by ffprobe: {src_path}")
+
+    tmpdir = tempfile.mkdtemp(prefix="wav16k_")
+    dst = os.path.join(tmpdir, "audio_16k_mono.wav")
+
+    # -y 覆盖；-vn 去视频；-sn 去字幕；-ac 1 单声道；-ar 16000 采样率；-map a:0 取第一个音轨
+    cmd = [
+        "ffmpeg", "-nostdin", "-hide_banner", "-y",
+        "-i", src_path,
+        "-vn", "-sn",
+        "-ac", "1",
+        "-ar", "16000",
+        "-map", "a:0",
+        "-loglevel", "error",
+        dst,
+    ]
+    try:
+        _run(cmd, timeout=900)
+    except Exception as e:
+        # 确保把临时目录清走（避免泄露），同时抛出更友好的错误
+        try:
+            shutil.rmtree(tmpdir)
+        except Exception:
+            pass
+        raise RuntimeError(f"ffmpeg decode failed: {e}")
+
+    # 最后做一道存在性校验
+    if not os.path.exists(dst) or os.path.getsize(dst) == 0:
+        try:
+            shutil.rmtree(tmpdir)
+        except Exception:
+            pass
+        raise RuntimeError("ffmpeg produced empty wav output")
+
+    return dst
 
 # ========= WhisperX 安全封装 =========
 
