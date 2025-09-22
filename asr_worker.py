@@ -64,8 +64,18 @@ def _get_diar(pyannote_token: str | None, device: str):
     import whisperx
     global _DIAR
     if _DIAR is None and pyannote_token:
-        _DIAR = whisperx.DiarizationPipeline(use_auth_token=pyannote_token, device=device)
+        _DIAR = whisperx.DiarizationPipeline(
+            use_auth_token=pyannote_token, device=device,
+            # 有先验可加速：min_speakers=2, max_speakers=3
+        )
     return _DIAR
+
+def _latin_ratio(s: str) -> float:
+    if not s:
+        return 0.0
+    latin = sum(ch.isascii() and ch.isalpha() for ch in s)
+    total = sum(ch.strip() != "" for ch in s)
+    return (latin / total) if total else 0.0
 
 
 
@@ -346,8 +356,8 @@ def _process_task(task_id: str):
     ):
         """
         返回:
-        words: List[Dict]  每个词 {start, end, text, (speaker)}
-        asr_raw: Dict      包含 language/segments/diarization 等原始信息
+        words: 词级（可能为空—在跳过对齐时）
+        asr_raw: dict = {"language", "segments", "diarization"}
         """
         import whisperx
 
@@ -357,48 +367,61 @@ def _process_task(task_id: str):
         asr = model.transcribe(
             audio_path,
             language=language,      # None -> 自动检测
-            task="transcribe",      # 或 "translate"
+            task="transcribe",
             batch_size=batch_size,
         )
         detected_lang = asr.get("language") or language or "auto"
+        segs = asr.get("segments", []) or []
 
-        # 2) 对齐
-        align_lang = (detected_lang if detected_lang != "auto" else (lang_hint or "zh"))
-        am, meta = _get_align(align_lang, device)
-        aligned = whisperx.align(asr["segments"], am, meta, audio_path, device)
+        # 2) 判断是否混合（含较多拉丁字母）
+        latin_share = 0.0
+        if segs:
+            latin_share = sum(_latin_ratio(s.get("text", "")) for s in segs) / max(1, len(segs))
+        is_mixed = latin_share > 0.20 and latin_share < 0.80  # 有一定英文占比就视为混合
 
-        # 3) 组织为 dict，方便后续 diar/抽词（assign_word_speakers 需要 dict）
-        result_dict = {
-            "segments": aligned.get("segments", []),
-            "language": detected_lang,
-        }
-
-        # 4) 说话人分离（可选）
+        # 3) 可选：说话人分离（先做，等会儿 assign）
         diarize_segments = None
         if enable_diar and pyannote_token:
             diar = _get_diar(pyannote_token, device)
             if diar is not None:
-                diarize_segments = diar(audio_path)  # list of {"start","end","speaker"}
-                # 关键：传 dict，不要传 list
-                result_dict = whisperx.assign_word_speakers(diarize_segments, result_dict)
+                diarize_segments = diar(audio_path)
 
-        # 5) 抽取词级
+        # 4) 对齐策略
+        result_segments = segs  # 先用 ASR 段
         words: List[Dict[str, Any]] = []
-        for seg in result_dict.get("segments", []):
-            spk = seg.get("speaker")
-            for w in (seg.get("words") or []):
-                # WhisperX word: {"word": "...", "start": ..., "end": ...}
-                if "word" in w and w.get("start") is not None and w.get("end") is not None:
-                    item = {"start": float(w["start"]), "end": float(w["end"]), "text": w["word"]}
-                    if spk:
-                        item["speaker"] = spk
-                    words.append(item)
+
+        if not is_mixed:
+            # 单语：打开对齐（避免“i s …”只在中文对英文、或英文对中文才会发生）
+            align_lang = (detected_lang if detected_lang != "auto" else (lang_hint or "zh"))
+            am, meta = _get_align(align_lang, device)
+            aligned = whisperx.align(segs, am, meta, audio_path, device)
+            result_segments = aligned.get("segments", [])
+
+            # 抽词
+            for seg in result_segments:
+                spk = seg.get("speaker")
+                for w in (seg.get("words") or []):
+                    if "word" in w and w.get("start") is not None and w.get("end") is not None:
+                        item = {"start": float(w["start"]), "end": float(w["end"]), "text": w["word"]}
+                        if spk:
+                            item["speaker"] = spk
+                        words.append(item)
+        else:
+            # 混合：跳过对齐，避免把英文拆成字符
+            pass
+
+        # 5) 说话人贴回（对 result_segments 操作；注意 assign 要 dict）
+        result_dict = {"segments": result_segments, "language": detected_lang}
+        if diarize_segments:
+            result_dict = whisperx.assign_word_speakers(diarize_segments, result_dict)
 
         return words, {
-            "language": result_dict.get("language"),
+            "language": detected_lang,
             "segments": result_dict.get("segments", []),
             "diarization": diarize_segments,
         }
+
+
 
     # B. Diarization：转为 10ms 帧级说话人标签 + 轻量平滑
     def diarize_to_frames(audio_path, device="cuda", num_speakers=None, min_spk=2, max_spk=5, frame_hop=0.01):
