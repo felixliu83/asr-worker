@@ -360,6 +360,7 @@ def _process_task(task_id: str):
             language=None,
             condition_on_previous_text=False,
             temperature=0.0,
+            beam_size=5,  # ← 新增：小 beam 提升边界稳定（速度 OK）
         )
         words: List[Dict[str, Any]] = []
         for seg in segments:
@@ -388,7 +389,7 @@ def _process_task(task_id: str):
                 pipeline.to(_device_for_pyannote())
                 # 给 pyannote 用规范化后的 wav（更稳）
                 wav_for_diar = _safe_wav_for_diar(norm_audio)
-                diar = pipeline(wav_for_diar)
+                diar = pipeline(wav_for_diar,num_speakers=3)
                 for turn, _, speaker in diar.itertracks(yield_label=True):
                     diar_turns.append((float(turn.start), float(turn.end), str(speaker)))
                 with lock:
