@@ -33,8 +33,10 @@ lock = threading.Lock()
 app.mount("/results", StaticFiles(directory=RESULT_DIR), name="results")
 
 ZW_RE = re.compile(r"[\x00-\x08\x0B-\x0C\x0E-\x1F\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]")
+
+INVIS_RE = re.compile(r"[\x00-\x08\x0B-\x0C\x0E-\x1F\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]")
 def _strip_invisibles(s: str) -> str:
-    return ZW_RE.sub("", s or "")
+    return INVIS_RE.sub("", s or "")
 
 
 def _device_for_pyannote():
@@ -191,7 +193,7 @@ def healthz():
     return {
         "ok": True,
         "model": WHISPER_MODEL,
-        "device": _resolve_device(),
+        "device": str(_resolve_device()),
         "simulate": SIMULATE,
         "version": version,
     }
