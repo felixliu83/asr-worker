@@ -1,6 +1,11 @@
+.git
 __pycache__/
 *.pyc
-.venv/
+*.pyo
+*.pyd
+*.log
 .env
 data/
-.DS_Store
+results/
+.cache/
+.huggingface/

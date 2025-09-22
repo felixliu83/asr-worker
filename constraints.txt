@@ -1,0 +1,20 @@
+# Torch 2.6.0+cu124 由基础镜像提供
+
+# WhisperX 及强依赖
+whisperx==3.3.1
+faster-whisper==1.1.0
+pyannote.audio==3.3.2
+ctranslate2==4.4.0
+
+# Transformers / tokenizers / accelerate
+transformers==4.56.2
+tokenizers==0.22.1
+accelerate==1.10.1
+
+# Numpy / Numba / llvmlite 经典稳定组合
+numpy==1.26.4
+numba==0.59.1
+llvmlite==0.42.0
+
+# 其它
+soundfile>=0.12,<1

@@ -1,34 +1,52 @@
-# 使用 CUDA 12.4 + cuDNN 9（与 faster-whisper 的 CUDA 依赖匹配）
-FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+# ====== PyTorch 2.6 + CUDA 12.4 ======
+FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
 
+ARG USE_TUNA=1
 ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    WORKDIR=/workspace \
-    REPO_DIR=/workspace/app \
-    # 给将来装 torch cu124 用（bootstrap 中 pip 会继承这个 env）
-    PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu124
+    TZ=Etc/UTC \
+    PIP_NO_CACHE_DIR=1 \
+    HF_HOME=/root/.cache/huggingface \
+    TRANSFORMERS_CACHE=/root/.cache/huggingface
 
-WORKDIR /workspace
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      ca-certificates tzdata curl wget git \
+      ffmpeg libsndfile1 tini && \
+    rm -rf /var/lib/apt/lists/*
 
-# 换源到清华，并加重试/超时
-RUN set -eux; \
-    cp -f /etc/apt/sources.list /etc/apt/sources.list.bak; \
-    sed -i 's|http://archive.ubuntu.com/ubuntu/|http://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g' /etc/apt/sources.list; \
-    sed -i 's|http://security.ubuntu.com/ubuntu/|http://mirrors.tuna.tsinghua.edu.cn/ubuntu/|g' /etc/apt/sources.list; \
-    apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update; \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        git ffmpeg python3 python3-pip python3-venv ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/*
+# 国内构建可走清华源
+RUN if [ "$USE_TUNA" = "1" ]; then \
+      python -m pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple && \
+      python -m pip config set global.trusted-host pypi.tuna.tsinghua.edu.cn; \
+    fi
 
-# 启动脚本（拉代码 + pip 安装 + 起服务）
-COPY bootstrap.sh /usr/local/bin/bootstrap.sh
-RUN chmod +x /usr/local/bin/bootstrap.sh
+RUN python -m pip install --upgrade pip && \
+    python - <<'PY'
+import torch
+print(">>> Base torch:", torch.__version__)
+assert torch.__version__.startswith("2.6"), "Base image torch must be 2.6.x"
+PY
 
-# 预创建挂载/产物目录
-RUN mkdir -p /workspace /workspace/app /workspace/data/uploads /workspace/data/results
+WORKDIR /workspace/app
+COPY constraints.txt ./constraints.txt
+RUN python -m pip install --no-cache-dir -r constraints.txt
 
+COPY requirements.txt ./requirements.txt
+RUN if [ -s requirements.txt ]; then \
+      python -m pip install --no-cache-dir -r requirements.txt; \
+    fi
+
+# 把你的代码打进镜像（包含 asr_worker.py / modules 等）
+COPY . /workspace/app
+
+ENV HOST=0.0.0.0 \
+    PORT=8000 \
+    ASR_ENGINE=whisperx \
+    DIARIZE=auto
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=5 \
+  CMD curl -fsS "http://localhost:${PORT}/healthz" || exit 1
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
 EXPOSE 8000
-
-# 容器主进程常驻：bootstrap 里运行 uvicorn
-CMD ["/usr/local/bin/bootstrap.sh"]
+CMD ["bash", "-lc", "uvicorn asr_worker:app --host ${HOST} --port ${PORT} --workers 1"]
